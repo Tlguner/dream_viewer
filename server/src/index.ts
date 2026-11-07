@@ -11,12 +11,14 @@ import { MockDreamProvider } from './providers/mock_provider.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
 import { MoodStyle, IDreamProvider, DreamSession } from './types/index.js';
 
-dotenv.config();
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Deterministic server root path (immune to working directory changes)
 const SERVER_ROOT = path.resolve(__dirname, '..');
+
+// Load environment configuration from server directory or project root
+dotenv.config({ path: path.join(SERVER_ROOT, '.env') });
+dotenv.config({ path: path.join(SERVER_ROOT, '..', '.env') });
 
 const app = express();
 const PORT = process.env.PORT || 5000;
