@@ -1,0 +1,42 @@
+name: Dream Viewer CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies (Client)
+        run: |
+          cd client
+          npm ci
+
+      - name: Typecheck & Build Client
+        run: |
+          cd client
+          npm run build
+
+      - name: Install dependencies (Server)
+        run: |
+          cd server
+          npm ci
+
+      - name: Typecheck & Build Server
+        run: |
+          cd server
+          npm run build

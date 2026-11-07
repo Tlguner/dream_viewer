@@ -1,0 +1,98 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum DreamStatus {
+  DRAFT
+  ANALYZING
+  KEYFRAMES_READY
+  VIDEO_GENERATING
+  COMPLETED
+  FAILED
+  REJECTED_MODERATION
+}
+
+enum MoodStyle {
+  ETHEREAL_LUCID
+  NOSTALGIC_FOG
+  SURREAL_CYBERPUNK
+  DEEP_OCEAN
+  FLOATING_SKY
+  GOLDEN_DREAM
+}
+
+model User {
+  id           String              @id @default(cuid())
+  email        String              @unique
+  username     String?
+  credits      Int                 @default(10) // 10 free initial credits
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  dreams       Dream[]
+  transactions CreditTransaction[]
+
+  @@map("users")
+}
+
+model Dream {
+  id              String       @id @default(cuid())
+  userId          String?
+  user            User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rawDreamText    String
+  refinedPrompt   String?
+  negativePrompt  String?
+  cameraMotion    String?
+  mood            MoodStyle    @default(ETHEREAL_LUCID)
+  status          DreamStatus  @default(DRAFT)
+  rejectionReason String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  keyframes       Keyframe[]
+  video           VideoClip?
+
+  @@map("dreams")
+}
+
+model Keyframe {
+  id         String   @id @default(cuid())
+  dreamId    String
+  dream      Dream    @relation(fields: [dreamId], references: [id], onDelete: Cascade)
+  imageUrl   String
+  isSelected Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@map("keyframes")
+}
+
+model VideoClip {
+  id               String   @id @default(cuid())
+  dreamId          String   @unique
+  dream            Dream    @relation(fields: [dreamId], references: [id], onDelete: Cascade)
+  videoUrl         String
+  durationSeconds  Int      @default(5)
+  effectiveSeconds Int      @default(10) // Played "on-twos"
+  fps              Int      @default(12)
+  faceBlurred      Boolean  @default(true)
+  audioMood        String   @default("ambient_binaural")
+  createdAt        DateTime @default(now())
+
+  @@map("video_clips")
+}
+
+model CreditTransaction {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount    Int      // Positive for deposit, negative for consumption
+  balance   Int
+  reason    String
+  createdAt DateTime @default(now())
+
+  @@map("credit_transactions")
+}

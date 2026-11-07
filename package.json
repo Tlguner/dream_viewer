@@ -1,0 +1,20 @@
+{
+  "name": "dream_viewer",
+  "version": "1.0.0",
+  "description": "Dream Viewer - Visualizing dreams through AI-guided keyframes and cinematic video generation",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev:client",
+    "dev:all": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:client": "npm run --prefix client dev",
+    "dev:server": "npm run --prefix server dev",
+    "build:client": "npm run --prefix client build",
+    "build:server": "npm run --prefix server build",
+    "build": "npm run build:client && npm run build:server",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
