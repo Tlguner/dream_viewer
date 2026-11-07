@@ -47,11 +47,13 @@ app.use(express.json({ limit: '100kb' }));
 const providerType = (process.env.DREAM_PROVIDER || 'comfy').toLowerCase().trim();
 let dreamProvider: IDreamProvider;
 
+const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
+
 if (providerType === 'comfy') {
   const comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188';
   dreamProvider = new ComfyDreamProvider(comfyHost, SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR);
 } else if (providerType === 'mock') {
-  dreamProvider = new MockDreamProvider(SERVER_BASE_URL, STORAGE_VIDEOS_DIR);
+  dreamProvider = new MockDreamProvider(SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR, FIXTURES_DIR);
 } else {
   throw new Error(
     `[CRITICAL STARTUP ERROR] Unknown DREAM_PROVIDER="${providerType}". ` +
