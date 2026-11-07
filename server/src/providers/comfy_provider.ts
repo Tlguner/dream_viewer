@@ -1,3 +1,6 @@
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
 import { 
   IDreamProvider, 
   DreamPromptAnalysis, 
@@ -11,11 +14,40 @@ export class ComfyDreamProvider implements IDreamProvider {
   public name = 'ComfyUI (Wan 2.2 5B + EasyCache GPU)';
   public isMock = false;
   private comfyHost: string;
+  private serverBaseUrl: string;
+  private storageVideosDir: string;
+  private storageKeyframesDir: string;
 
-  constructor(comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188') {
+  // Configurable Wan 2.2 parameters
+  private config = {
+    videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
+    easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
+    steps: parseInt(process.env.WAN_STEPS || '15', 10),
+    width: parseInt(process.env.WAN_WIDTH || '832', 10),
+    height: parseInt(process.env.WAN_HEIGHT || '480', 10),
+    fps: parseInt(process.env.WAN_FPS || '24', 10),
+    shift: parseFloat(process.env.WAN_SHIFT || '8.0'),
+    cfg: parseFloat(process.env.WAN_CFG || '5.0'),
+  };
+
+  constructor(
+    comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188',
+    serverBaseUrl = process.env.SERVER_BASE_URL || 'http://127.0.0.1:5000',
+    storageVideosDir = path.resolve('storage', 'videos'),
+    storageKeyframesDir = path.resolve('storage', 'keyframes')
+  ) {
     this.comfyHost = comfyHost.replace(/\/$/, '');
+    this.serverBaseUrl = serverBaseUrl.replace(/\/$/, '');
+    this.storageVideosDir = storageVideosDir;
+    this.storageKeyframesDir = storageKeyframesDir;
+
+    fs.mkdirSync(this.storageVideosDir, { recursive: true });
+    fs.mkdirSync(this.storageKeyframesDir, { recursive: true });
   }
 
+  /**
+   * Basic sanitization for prompt strings
+   */
   private sanitizeForPrompt(text: string): string {
     return text
       .replace(/[\r\n\t]+/g, ' ')
@@ -28,7 +60,6 @@ export class ComfyDreamProvider implements IDreamProvider {
     const cleanText = this.sanitizeForPrompt(rawText);
     const detectedMood = moodHint || 'ETHEREAL_LUCID';
 
-    // Cinematic prompt refinement tailored for Wan 2.2 diffusion video
     const refinedPrompt = `Surreal ethereal dreamscape: ${cleanText}. Volumetric fog, chromatic lighting, anamorphic lens flare, deep cosmic haze, solitary silhouette seen strictly from behind in shadows, no visible human face, magical realism, 35mm film grain, 8k cinematic masterpiece.`;
     const cameraMotion = 'Slow forward dolly tracking push with hypnotic subtle rotational tilt and floating weightlessness';
 
@@ -45,10 +76,208 @@ export class ComfyDreamProvider implements IDreamProvider {
     };
   }
 
+  /**
+   * Cancel and clear a running or pending ComfyUI prompt
+   */
+  private async cancelComfyJob(promptId: string): Promise<void> {
+    console.log(`⚠️ [ComfyDreamProvider] Attempting to cancel/interrupt job ${promptId}...`);
+    try {
+      // 1. Interrupt actively running execution
+      await fetch(`${this.comfyHost}/interrupt`, { method: 'POST' });
+      // 2. Remove from pending queue if not started
+      await fetch(`${this.comfyHost}/queue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ delete: [promptId] })
+      });
+      console.log(`✅ [ComfyDreamProvider] Prompt ${promptId} successfully cancelled.`);
+    } catch (err: any) {
+      console.warn(`Failed to cancel ComfyUI job ${promptId}:`, err.message);
+    }
+  }
+
+  /**
+   * Generate keyframe images.
+   * Leverages Wan 2.2 length:1 text-to-image mode to produce real GPU keyframes,
+   * with graceful fallback to curated anchors if ComfyUI is unavailable.
+   */
   public async generateKeyframes(refinedPrompt: string, count: number = 3): Promise<KeyframeOption[]> {
-    // High-resolution artistic composition anchors for keyframe selection
-    // Explicitly marked as isMock: true to avoid misleading the user until a dedicated
-    // local text-to-image keyframe pipeline is loaded into ComfyUI.
+    console.log(`🎨 [ComfyDreamProvider] Synthesizing dream keyframes on ComfyUI (target: ${count})...`);
+
+    try {
+      const generatedKeyframes: KeyframeOption[] = [];
+
+      // Generate 1 primary high-fidelity keyframe from Wan 2.2 on GPU
+      const keyframeSeed = Math.floor(Math.random() * 9007199254740991);
+      const kfPrompt: Record<string, any> = {
+        "37": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "60": {
+          "class_type": "EasyCache",
+          "inputs": {
+            "reuse_threshold": this.config.easyCacheThreshold,
+            "start_percent": 0.15,
+            "end_percent": 0.95,
+            "verbose": false,
+            "model": ["37", 0]
+          }
+        },
+        "48": {
+          "class_type": "ModelSamplingSD3",
+          "inputs": {
+            "shift": this.config.shift,
+            "model": ["60", 0]
+          }
+        },
+        "38": {
+          "class_type": "CLIPLoader",
+          "inputs": {
+            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "type": "wan",
+            "device": "default"
+          }
+        },
+        "39": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "wan2.2_vae.safetensors"
+          }
+        },
+        "6": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": this.sanitizeForPrompt(refinedPrompt),
+            "clip": ["38", 0]
+          }
+        },
+        "7": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": "nsfw, nude, naked, erotic, gore, blood, violence, close-up human face, cartoon, flat lighting, blurry, low resolution, watermark",
+            "clip": ["38", 0]
+          }
+        },
+        "55": {
+          "class_type": "Wan22ImageToVideoLatent",
+          "inputs": {
+            "width": this.config.width,
+            "height": this.config.height,
+            "length": 1, // 1 frame produces a still image
+            "batch_size": 1,
+            "vae": ["39", 0]
+          }
+        },
+        "3": {
+          "class_type": "KSampler",
+          "inputs": {
+            "seed": keyframeSeed,
+            "steps": Math.min(this.config.steps, 15),
+            "cfg": this.config.cfg,
+            "sampler_name": "uni_pc",
+            "scheduler": "simple",
+            "denoise": 1,
+            "model": ["48", 0],
+            "positive": ["6", 0],
+            "negative": ["7", 0],
+            "latent_image": ["55", 0]
+          }
+        },
+        "8": {
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": ["3", 0],
+            "vae": ["39", 0]
+          }
+        },
+        "58": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "keyframe/DreamViewer",
+            "images": ["8", 0]
+          }
+        }
+      };
+
+      const queueRes = await fetch(`${this.comfyHost}/prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: kfPrompt })
+      });
+
+      if (queueRes.ok) {
+        const queueData = (await queueRes.json()) as any;
+        const promptId = queueData.prompt_id;
+        
+        // Poll for keyframe completion (up to 45 seconds)
+        const kfStartTime = Date.now();
+        let kfCompleted = false;
+
+        while (Date.now() - kfStartTime < 45_000) {
+          await new Promise(r => setTimeout(r, 1500));
+          const hRes = await fetch(`${this.comfyHost}/history/${promptId}`);
+          if (!hRes.ok) continue;
+
+          const hData = (await hRes.json()) as any;
+          if (hData && hData[promptId]?.outputs?.['58']?.images?.length > 0) {
+            const outImg = hData[promptId].outputs['58'].images[0];
+            const comfyViewUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(outImg.filename)}&subfolder=${encodeURIComponent(outImg.subfolder || '')}&type=output`;
+            
+            // Download and persist in server's storage
+            const imgRes = await fetch(comfyViewUrl);
+            if (imgRes.ok) {
+              const imgBuf = Buffer.from(await imgRes.arrayBuffer());
+              const keyframeId = `kf_gpu_${Date.now()}_1`;
+              const localFilename = `${keyframeId}.png`;
+              await fs.promises.writeFile(path.join(this.storageKeyframesDir, localFilename), imgBuf);
+
+              generatedKeyframes.push({
+                id: keyframeId,
+                imageUrl: `${this.serverBaseUrl}/api/media/keyframes/${localFilename}`,
+                aspectRatio: '16:9',
+                seed: keyframeSeed,
+                isMock: false, // Real GPU generated keyframe!
+                isSelected: true
+              });
+              kfCompleted = true;
+            }
+            break;
+          }
+        }
+
+        if (!kfCompleted) {
+          await this.cancelComfyJob(promptId);
+        }
+      }
+
+      // If GPU keyframe succeeded, add it to options
+      if (generatedKeyframes.length > 0) {
+        // Also provide 2 complementary curated anchors for variety
+        const secondaryAnchors = [
+          'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1200&q=80',
+          'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80'
+        ];
+        secondaryAnchors.forEach((url, i) => {
+          generatedKeyframes.push({
+            id: `kf_anchor_${Date.now()}_${i + 2}`,
+            imageUrl: url,
+            aspectRatio: '16:9',
+            seed: Math.floor(Math.random() * 9999999),
+            isMock: true,
+            isSelected: false
+          });
+        });
+        return generatedKeyframes.slice(0, count);
+      }
+    } catch (err: any) {
+      console.warn(`Keyframe GPU synthesis skipped or failed: ${err.message}. Falling back to curated anchors.`);
+    }
+
+    // Fallback: curated composition anchors marked isMock: true
     const anchorPresets = [
       'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1200&q=80',
       'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80',
@@ -60,7 +289,7 @@ export class ComfyDreamProvider implements IDreamProvider {
       imageUrl: url,
       aspectRatio: '16:9',
       seed: Math.floor(Math.random() * 9999999),
-      isMock: true, // Honestly flagged: curated anchor composition
+      isMock: true,
       isSelected: index === 0
     }));
   }
@@ -89,9 +318,18 @@ export class ComfyDreamProvider implements IDreamProvider {
   }
 
   /**
-   * Fetch image bytes from URL or local file
+   * Retrieve image bytes from local disk or URL
    */
   private async fetchImageBytes(imageUrl: string): Promise<Buffer> {
+    // If it points to our local server storage, read directly from disk
+    if (imageUrl.includes('/api/media/keyframes/')) {
+      const filename = path.basename(imageUrl);
+      const localPath = path.join(this.storageKeyframesDir, filename);
+      if (fs.existsSync(localPath)) {
+        return await fs.promises.readFile(localPath);
+      }
+    }
+
     const res = await fetch(imageUrl);
     if (!res.ok) {
       throw new Error(`Failed to retrieve keyframe image from ${imageUrl}: ${res.statusText}`);
@@ -101,7 +339,7 @@ export class ComfyDreamProvider implements IDreamProvider {
   }
 
   /**
-   * Submit and poll Wan 2.2 I2V workflow on ComfyUI
+   * Submit and poll Wan 2.2 I2V workflow on ComfyUI, download result, and persist locally
    */
   public async generateVideo(
     selectedKeyframe: KeyframeOption,
@@ -110,17 +348,17 @@ export class ComfyDreamProvider implements IDreamProvider {
   ): Promise<DreamVideoResult> {
     console.log(`📡 [ComfyDreamProvider] Starting Image-to-Video generation on ComfyUI at ${this.comfyHost}...`);
 
-    // 1. Fetch Keyframe image
+    // 1. Fetch Keyframe image bytes
     const imageBytes = await this.fetchImageBytes(selectedKeyframe.imageUrl);
-    const uploadedFilename = `dream_kf_${Date.now()}.png`;
+    const uploadedFilename = `dream_kf_${Date.now()}_${crypto.randomUUID().substring(0, 8)}.png`;
 
     // 2. Upload to ComfyUI
     const comfyImageName = await this.uploadImageToComfy(imageBytes, uploadedFilename);
     console.log(`🖼️ [ComfyDreamProvider] Keyframe uploaded to ComfyUI as: ${comfyImageName}`);
 
-    // 3. Build Wan 2.2 5B + EasyCache Image-to-Video Graph
+    // 3. Build Wan 2.2 5B + EasyCache Image-to-Video Graph with configured parameters
     const seed = Math.floor(Math.random() * 9007199254740991);
-    const videoFrames = 81; // 81 frames @ 24fps (~3.4s native, ~6.8s on-twos). Safe for 8GB VRAM.
+    const { videoFrames, easyCacheThreshold, steps, width, height, fps, shift, cfg } = this.config;
 
     const workflowPrompt: Record<string, any> = {
       "37": {
@@ -133,7 +371,7 @@ export class ComfyDreamProvider implements IDreamProvider {
       "60": {
         "class_type": "EasyCache",
         "inputs": {
-          "reuse_threshold": 0.2,
+          "reuse_threshold": easyCacheThreshold,
           "start_percent": 0.15,
           "end_percent": 0.95,
           "verbose": false,
@@ -143,7 +381,7 @@ export class ComfyDreamProvider implements IDreamProvider {
       "48": {
         "class_type": "ModelSamplingSD3",
         "inputs": {
-          "shift": 8.0,
+          "shift": shift,
           "model": ["60", 0]
         }
       },
@@ -184,8 +422,8 @@ export class ComfyDreamProvider implements IDreamProvider {
       "55": {
         "class_type": "Wan22ImageToVideoLatent",
         "inputs": {
-          "width": 832,
-          "height": 480,
+          "width": width,
+          "height": height,
           "length": videoFrames,
           "batch_size": 1,
           "vae": ["39", 0],
@@ -196,8 +434,8 @@ export class ComfyDreamProvider implements IDreamProvider {
         "class_type": "KSampler",
         "inputs": {
           "seed": seed,
-          "steps": 15,
-          "cfg": 5,
+          "steps": steps,
+          "cfg": cfg,
           "sampler_name": "uni_pc",
           "scheduler": "simple",
           "denoise": 1,
@@ -217,7 +455,7 @@ export class ComfyDreamProvider implements IDreamProvider {
       "57": {
         "class_type": "CreateVideo",
         "inputs": {
-          "fps": 24,
+          "fps": fps,
           "bit_depth": "auto",
           "color_space": "sRGB",
           "codec": "none",
@@ -257,32 +495,51 @@ export class ComfyDreamProvider implements IDreamProvider {
     const timeoutMs = 300_000;
     let completedHistory: any = null;
 
-    while (Date.now() - startTime < timeoutMs) {
-      await new Promise(r => setTimeout(r, 2000));
+    try {
+      while (Date.now() - startTime < timeoutMs) {
+        await new Promise(r => setTimeout(r, 2000));
 
-      const histRes = await fetch(`${this.comfyHost}/history/${promptId}`);
-      if (!histRes.ok) continue;
+        const histRes = await fetch(`${this.comfyHost}/history/${promptId}`);
+        if (!histRes.ok) continue;
 
-      const histData = (await histRes.json()) as any;
-      if (histData && histData[promptId]) {
-        const item = histData[promptId];
-        if (item.status?.status_str === 'error') {
-          const errMsg = item.status?.messages?.[0]?.[1]?.message || 'ComfyUI execution error';
-          throw new Error(`ComfyUI workflow failed: ${errMsg}`);
-        }
+        const histData = (await histRes.json()) as any;
+        if (histData && histData[promptId]) {
+          const item = histData[promptId];
 
-        if (item.outputs && Object.keys(item.outputs).length > 0) {
-          completedHistory = item;
-          break;
+          // Accurate error extraction from execution_error message
+          if (item.status?.status_str === 'error') {
+            let errMsg = 'ComfyUI execution error';
+            if (Array.isArray(item.status?.messages)) {
+              const errEntry = item.status.messages.find((m: any) => m[0] === 'execution_error');
+              if (errEntry && errEntry[1]) {
+                const { exception_message, exception_type, node_type } = errEntry[1];
+                errMsg = `${node_type || 'Node'} failed [${exception_type || 'Error'}]: ${exception_message || 'Unknown error'}`;
+              }
+            }
+            throw new Error(errMsg);
+          }
+
+          if (item.outputs && Object.keys(item.outputs).length > 0) {
+            completedHistory = item;
+            break;
+          }
         }
       }
+
+      if (!completedHistory) {
+        // Timeout reached: actively cancel the job so it does not jam ComfyUI
+        await this.cancelComfyJob(promptId);
+        throw new Error(`ComfyUI video generation timed out after ${timeoutMs / 1000} seconds. Job cancelled.`);
+      }
+    } catch (pollErr: any) {
+      // Ensure job is cancelled on any unexpected abortion
+      if (!completedHistory) {
+        await this.cancelComfyJob(promptId);
+      }
+      throw pollErr;
     }
 
-    if (!completedHistory) {
-      throw new Error(`ComfyUI video generation timed out after ${timeoutMs / 1000} seconds.`);
-    }
-
-    // 6. Find output video file
+    // 6. Find output video file from history
     let videoFilename = '';
     let videoSubfolder = 'video';
     const outputs = completedHistory.outputs;
@@ -308,18 +565,34 @@ export class ComfyDreamProvider implements IDreamProvider {
       throw new Error('ComfyUI finished execution but no video output file was found in output nodes.');
     }
 
-    const videoUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(videoFilename)}&subfolder=${encodeURIComponent(videoSubfolder)}&type=output`;
-    const nativeDuration = Math.round(videoFrames / 24); // ~3s
-    const effectiveDuration = nativeDuration * 2;        // ~6s on-twos
+    // 7. Download video from ComfyUI and persist inside server storage
+    const comfyVideoUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(videoFilename)}&subfolder=${encodeURIComponent(videoSubfolder)}&type=output`;
+    const videoStreamRes = await fetch(comfyVideoUrl);
+    if (!videoStreamRes.ok) {
+      throw new Error(`Failed to fetch generated video from ComfyUI (${videoStreamRes.status})`);
+    }
 
-    console.log(`🎬 [ComfyDreamProvider] Video successfully generated: ${videoUrl}`);
+    const videoBuffer = Buffer.from(await videoStreamRes.arrayBuffer());
+    const videoId = `vid_${Date.now()}_${crypto.randomUUID().substring(0, 8)}`;
+    const localVideoFilename = `${videoId}.mp4`;
+    const localVideoPath = path.join(this.storageVideosDir, localVideoFilename);
+
+    await fs.promises.writeFile(localVideoPath, videoBuffer);
+    console.log(`💾 [ComfyDreamProvider] Video saved to server storage: ${localVideoPath} (${videoBuffer.length} bytes)`);
+
+    // 8. Construct self-hosted server media URL
+    const serverMediaUrl = `${this.serverBaseUrl}/api/media/videos/${localVideoFilename}`;
+    const nativeDuration = Math.max(1, Math.round(videoFrames / fps)); // e.g. 49 / 24 = ~2s
+    const effectiveDuration = nativeDuration * 2;                      // e.g. ~4s on-twos
+
+    console.log(`🎬 [ComfyDreamProvider] Serving video from: ${serverMediaUrl}`);
 
     return {
-      id: `comfy_vid_${Date.now()}`,
-      videoUrl,
+      id: videoId,
+      videoUrl: serverMediaUrl,
       durationSeconds: nativeDuration,
       effectiveSeconds: effectiveDuration,
-      fps: 24,
+      fps: fps,
       playbackRate: 0.5,
       faceBlurred: false,
       audioMood: 'ethereal_lucid_pad',

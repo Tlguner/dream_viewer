@@ -16,7 +16,8 @@ async function runApiVerification() {
   assert.strictEqual(health.status, 'online', 'Status must be online');
   assert.strictEqual(typeof health.provider, 'string', 'Provider name must be string');
   assert.strictEqual(typeof health.isMock, 'boolean', 'isMock must be boolean');
-  console.log(`  ✓ Passed: Provider=${health.provider}, isMock=${health.isMock}`);
+  assert.strictEqual(typeof health.isGpuBusy, 'boolean', 'isGpuBusy must be boolean');
+  console.log(`  ✓ Passed: Provider=${health.provider}, isMock=${health.isMock}, isGpuBusy=${health.isGpuBusy}`);
 
   // 2. User Profile & Credits
   console.log('\nTest 2: User profile & initial credit verification');
@@ -86,7 +87,7 @@ async function runApiVerification() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      rawDreamText: 'Floating cathedral library with glowing flying books in violet clouds',
+      rawDreamText: 'Floating crystal sanctuary over deep amethyst clouds in starlight',
       moodHint: 'ETHEREAL_LUCID'
     })
   });

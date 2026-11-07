@@ -52,7 +52,6 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
   const [isOnTwos, setIsOnTwos] = useState(true);
   const [notice, setNotice] = useState<{ message: string; isError?: boolean } | null>(null);
   const [isExporting, setIsExporting] = useState(false);
-  const [copiedShare, setCopiedShare] = useState(false);
 
   // Trigger celebration confetti & ambient audio on mount
   useEffect(() => {
@@ -119,36 +118,6 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
       setTimeout(() => setNotice(null), 4000);
     } finally {
       setIsExporting(false);
-    }
-  };
-
-  // REAL Share: Copies the actual dream video URL or invokes Native Web Share API
-  const handleShare = async () => {
-    const videoUrl = dream.video.videoUrl;
-    if (navigator.share) {
-      try {
-        await navigator.share({
-          title: dream.title || 'My AI Lucid Dream',
-          text: `Check out my lucid dream visualized with DreamViewer: "${dream.prompt}"`,
-          url: videoUrl
-        });
-        return;
-      } catch (err) {
-        // Fallback to clipboard if user dismissed native share dialog
-      }
-    }
-
-    try {
-      await navigator.clipboard.writeText(videoUrl);
-      setCopiedShare(true);
-      setNotice({ message: 'Direct MP4 video URL copied to clipboard!' });
-      setTimeout(() => {
-        setNotice(null);
-        setCopiedShare(false);
-      }, 3500);
-    } catch (e) {
-      setNotice({ message: `Share URL: ${videoUrl}` });
-      setTimeout(() => setNotice(null), 4000);
     }
   };
 
@@ -336,13 +305,14 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
             <span>{isExporting ? 'Exporting...' : 'Export MP4'}</span>
           </button>
 
-          {/* Real Share Button */}
+          {/* Share Button (Disabled until public permalink & auth are implemented) */}
           <button
-            onClick={handleShare}
-            className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs transition-all active:scale-95"
+            disabled
+            title="Public dream permalinks & user authentication are in active development"
+            className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-slate-800/40 border border-slate-700/50 text-slate-500 text-xs cursor-not-allowed select-none"
           >
-            {copiedShare ? <Check className="w-4 h-4 text-emerald-400" /> : <Share2 className="w-4 h-4" />}
-            <span>{copiedShare ? 'Copied!' : 'Share Video'}</span>
+            <Share2 className="w-4 h-4 text-slate-500" />
+            <span>Share (Coming Soon)</span>
           </button>
         </div>
 

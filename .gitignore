@@ -50,4 +50,6 @@ venv/
 *.pth
 *.ckpt
 *.mp4
+server/storage/
+storage/
 ai_service/static_videos/

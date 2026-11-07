@@ -57,7 +57,9 @@ export interface DreamSession {
   mood: MoodStyle;
   keyframes: KeyframeOption[];
   video?: DreamVideoResult;
+  status: 'draft' | 'analyzed' | 'keyframes_ready' | 'generating' | 'completed' | 'failed';
   createdAt: string;
+  expiresAt: number;
 }
 
 export interface IDreamProvider {

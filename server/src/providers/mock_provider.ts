@@ -1,3 +1,5 @@
+import path from 'path';
+import fs from 'fs';
 import { 
   IDreamProvider, 
   DreamPromptAnalysis, 
@@ -10,6 +12,8 @@ import { SafetyShield } from '../moderation/shield.js';
 export class MockDreamProvider implements IDreamProvider {
   public name = 'MockDreamProvider (Simulation)';
   public isMock = true;
+  private serverBaseUrl: string;
+  private storageVideosDir: string;
 
   private mockKeyframes: Record<MoodStyle, string[]> = {
     ETHEREAL_LUCID: [
@@ -48,6 +52,15 @@ export class MockDreamProvider implements IDreamProvider {
     'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
     'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
   ];
+
+  constructor(
+    serverBaseUrl = process.env.SERVER_BASE_URL || 'http://127.0.0.1:5000',
+    storageVideosDir = path.resolve('storage', 'videos')
+  ) {
+    this.serverBaseUrl = serverBaseUrl.replace(/\/$/, '');
+    this.storageVideosDir = storageVideosDir;
+    fs.mkdirSync(this.storageVideosDir, { recursive: true });
+  }
 
   private sanitizeForPrompt(text: string): string {
     return text
@@ -104,15 +117,36 @@ export class MockDreamProvider implements IDreamProvider {
   }
 
   public async generateVideo(
-    selectedKeyframe: KeyframeOption, 
-    prompt: string, 
-    cameraMotion: string
+    _selectedKeyframe: KeyframeOption, 
+    _prompt: string, 
+    _cameraMotion: string
   ): Promise<DreamVideoResult> {
     await new Promise(r => setTimeout(r, 1200));
 
+    const videoId = `mock_vid_${Date.now()}`;
+    const filename = `${videoId}.mp4`;
+    const localPath = path.join(this.storageVideosDir, filename);
+
+    // Provide a self-hosted URL; create a minimal placeholder file if not exists
+    let videoUrl = `${this.serverBaseUrl}/api/media/videos/${filename}`;
+    try {
+      if (!fs.existsSync(localPath)) {
+        // Attempt to fetch sample and cache locally
+        const sampleRes = await fetch(this.mockVideos[0]);
+        if (sampleRes.ok) {
+          const buf = Buffer.from(await sampleRes.arrayBuffer());
+          await fs.promises.writeFile(localPath, buf);
+        } else {
+          videoUrl = this.mockVideos[0];
+        }
+      }
+    } catch {
+      videoUrl = this.mockVideos[0];
+    }
+
     return {
-      id: `mock_vid_${Date.now()}`,
-      videoUrl: this.mockVideos[0],
+      id: videoId,
+      videoUrl,
       durationSeconds: 5,        // 5 seconds native at 24fps
       effectiveSeconds: 10,      // 10 seconds played on-twos (0.5x speed / 12fps)
       fps: 24,                   // native export 24fps
