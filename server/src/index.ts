@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { SafetyShield } from './moderation/shield.js';
 import { MockDreamProvider } from './providers/mock_provider.js';
@@ -12,13 +13,20 @@ import { MoodStyle, IDreamProvider, DreamSession } from './types/index.js';
 
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Deterministic server root path (immune to working directory changes)
+const SERVER_ROOT = path.resolve(__dirname, '..');
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || '127.0.0.1';
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://${HOST}:${PORT}`;
 
-// Create local media storage directories
-const STORAGE_DIR = path.resolve('storage');
+// Deterministic local media storage directories
+const STORAGE_DIR = process.env.STORAGE_DIR 
+  ? path.resolve(process.env.STORAGE_DIR) 
+  : path.join(SERVER_ROOT, 'storage');
 const STORAGE_VIDEOS_DIR = path.join(STORAGE_DIR, 'videos');
 const STORAGE_KEYFRAMES_DIR = path.join(STORAGE_DIR, 'keyframes');
 fs.mkdirSync(STORAGE_VIDEOS_DIR, { recursive: true });
@@ -62,7 +70,7 @@ const demoUser = {
 // Stateful dream sessions: Prevents moderation bypass, prompt injection, and SSRF
 const dreamSessions = new Map<string, DreamSession>();
 
-// Concurrency guard: Only 1 active generation allowed on single GPU
+// Concurrency guard: Only 1 active generation allowed on single local GPU (videos & keyframes)
 let isGpuBusy = false;
 
 // Evict expired sessions periodically (1-hour TTL)
@@ -75,6 +83,31 @@ setInterval(() => {
     }
   }
 }, 10 * 60 * 1000).unref();
+
+// Periodic Storage Cleanup: Prune files older than 24 hours
+const FILE_RETENTION_MS = 24 * 60 * 60 * 1000;
+function pruneOldFiles(dirPath: string) {
+  try {
+    if (!fs.existsSync(dirPath)) return;
+    const files = fs.readdirSync(dirPath);
+    const now = Date.now();
+    for (const file of files) {
+      const fullPath = path.join(dirPath, file);
+      const stat = fs.statSync(fullPath);
+      if (now - stat.mtimeMs > FILE_RETENTION_MS) {
+        fs.unlinkSync(fullPath);
+        console.log(`🧹 [StorageCleanup] Pruned expired file: ${file}`);
+      }
+    }
+  } catch (err: any) {
+    console.warn(`Storage cleanup error in ${dirPath}:`, err.message);
+  }
+}
+
+setInterval(() => {
+  pruneOldFiles(STORAGE_VIDEOS_DIR);
+  pruneOldFiles(STORAGE_KEYFRAMES_DIR);
+}, 60 * 60 * 1000).unref();
 
 // In-memory gallery of completed dreams
 const recentDreams: any[] = [];
@@ -123,7 +156,8 @@ app.get('/api/user/profile', (req, res) => {
   res.json(demoUser);
 });
 
-// Self-Hosted Media Serving: Videos with HTTP Range requests (scrubbing/streaming)
+// Self-Hosted Media Serving: Videos using Express native res.sendFile
+// Handles Range requests, 206 Partial Content, suffix ranges (-500), 416, and ETags automatically
 app.get('/api/media/videos/:filename', (req, res) => {
   const safeFilename = path.basename(req.params.filename);
   const filePath = path.join(STORAGE_VIDEOS_DIR, safeFilename);
@@ -132,41 +166,11 @@ app.get('/api/media/videos/:filename', (req, res) => {
     return res.status(404).json({ error: 'FILE_NOT_FOUND', message: 'Requested video does not exist.' });
   }
 
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Access-Control-Allow-Origin', '*');
-
-  if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-    if (start >= fileSize) {
-      res.status(416).setHeader('Content-Range', `bytes */${fileSize}`).end();
-      return;
-    }
-
-    const chunksize = (end - start) + 1;
-    const file = fs.createReadStream(filePath, { start, end });
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Content-Length': chunksize,
-      'Content-Type': 'video/mp4',
-    });
-    file.pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': 'video/mp4',
-    });
-    fs.createReadStream(filePath).pipe(res);
-  }
+  res.sendFile(filePath);
 });
 
-// Self-Hosted Media Serving: Keyframe Images
+// Self-Hosted Media Serving: Keyframe Images using Express native res.sendFile
 app.get('/api/media/keyframes/:filename', (req, res) => {
   const safeFilename = path.basename(req.params.filename);
   const filePath = path.join(STORAGE_KEYFRAMES_DIR, safeFilename);
@@ -175,9 +179,8 @@ app.get('/api/media/keyframes/:filename', (req, res) => {
     return res.status(404).json({ error: 'FILE_NOT_FOUND', message: 'Requested keyframe does not exist.' });
   }
 
-  res.setHeader('Content-Type', 'image/png');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  fs.createReadStream(filePath).pipe(res);
+  res.sendFile(filePath);
 });
 
 // Step 1: Dream Architect - Moderation & Cinematic Prompt Refinement
@@ -235,7 +238,7 @@ app.post('/api/dreams/analyze', async (req, res) => {
   }
 });
 
-// Step 2: Generate Keyframe Previews (Server session locked)
+// Step 2: Generate Keyframe Previews (Server session locked + GPU concurrency lock)
 app.post('/api/dreams/keyframes', async (req, res) => {
   try {
     const parseResult = KeyframesSchema.safeParse(req.body);
@@ -255,19 +258,32 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       });
     }
 
-    // Refresh TTL
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    // GPU concurrency guard: prevent concurrent jobs on 8GB VRAM
+    if (isGpuBusy) {
+      return res.status(429).json({
+        error: 'GPU_BUSY',
+        message: 'The local GPU is currently busy synthesizing another vision or video. Please wait a moment.'
+      });
+    }
 
-    // Generate keyframes using server-locked prompt
-    const keyframes = await dreamProvider.generateKeyframes(session.refinedPrompt, count);
-    session.keyframes = keyframes;
-    session.status = 'keyframes_ready';
+    isGpuBusy = true;
+    try {
+      // Refresh TTL
+      session.expiresAt = Date.now() + SESSION_TTL_MS;
 
-    res.json({
-      success: true,
-      dreamId,
-      keyframes
-    });
+      // Generate keyframes using server-locked prompt
+      const keyframes = await dreamProvider.generateKeyframes(session.refinedPrompt, count);
+      session.keyframes = keyframes;
+      session.status = 'keyframes_ready';
+
+      res.json({
+        success: true,
+        dreamId,
+        keyframes
+      });
+    } finally {
+      isGpuBusy = false;
+    }
   } catch (error: any) {
     console.error('Error generating keyframes:', error);
     res.status(500).json({ error: 'FAILED_TO_GENERATE_KEYFRAMES', message: error.message });
@@ -294,7 +310,7 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     });
   }
 
-  // 1. Session-level lock: Prevent duplicate requests on the same session
+  // 1. Session-level lock: Prevent duplicate concurrent requests on the same session (409 Conflict)
   if (session.status === 'generating') {
     return res.status(409).json({
       error: 'GENERATION_IN_PROGRESS',

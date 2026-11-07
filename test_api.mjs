@@ -99,7 +99,7 @@ async function runApiVerification() {
   console.log(`  ✓ Passed: Session created with dreamId=${dreamId}`);
 
   // 5. Keyframes Generation with Server-Locked Session
-  console.log('\nTest 5: Keyframe generation requiring valid dreamId');
+  console.log('\nTest 5: Keyframe generation requiring valid dreamId & verifying mock status');
   
   // 5a: Missing / invalid dreamId must return 404
   const badKfRes = await fetch(`${BASE_URL}/dreams/keyframes`, {
@@ -118,11 +118,21 @@ async function runApiVerification() {
   });
   assert.strictEqual(goodKfRes.status, 200);
   const kfData = await goodKfRes.json();
-  assert.strictEqual(kfData.keyframes.length, 3, 'Must return 3 keyframes');
-  assert(kfData.keyframes[0].id, 'Keyframe must have id');
-  assert(kfData.keyframes[0].imageUrl, 'Keyframe must have imageUrl');
-  assert.strictEqual(typeof kfData.keyframes[0].isMock, 'boolean', 'Keyframe must have isMock flag');
-  console.log(`  ✓ Passed: Generated 3 keyframes (isMock=${kfData.keyframes[0].isMock})`);
+  assert.strictEqual(kfData.keyframes.length, 3, 'Must return exactly 3 keyframes');
+
+  // In Comfy mode: ALL 3 keyframes MUST have isMock === false (no Unsplash stock photo fallback!)
+  if (!health.isMock) {
+    const allReal = kfData.keyframes.every((k) => k.isMock === false);
+    assert.strictEqual(allReal, true, 'CRITICAL: In comfy mode, ALL 3 keyframes must be real GPU generated (isMock === false)!');
+    console.log('  ✓ Passed: All 3 keyframes are 100% genuine GPU outputs (isMock === false on all items)');
+  } else {
+    console.log('  ✓ Passed: Keyframes returned in mock mode with honest isMock=true');
+  }
+
+  // Verify keyframes are served by our media server
+  const kfMediaRes = await fetch(kfData.keyframes[0].imageUrl);
+  assert.strictEqual(kfMediaRes.status, 200, 'Keyframe image must be accessible via media endpoint');
+  console.log(`  ✓ Passed: Keyframe image endpoint returns 200 OK (${kfData.keyframes[0].imageUrl})`);
 
   // 6. Security & SSRF Protection: Arbitrary Keyframe ID Rejected
   console.log('\nTest 6: SSRF & tampering rejection with unapproved keyframe ID');
@@ -138,11 +148,35 @@ async function runApiVerification() {
   assert.strictEqual(fakeKfVideoRes.status, 400, 'Unapproved keyframe ID must return 400');
   console.log('  ✓ Passed: Unapproved keyframe ID rejected');
 
-  // 7. Credit Integrity on Failure / Execution
-  console.log('\nTest 7: Credit deduction semantics (Credits NOT deducted on rejection)');
-  const profileAfterBadCall = await (await fetch(`${BASE_URL}/user/profile`)).json();
-  assert.strictEqual(profileAfterBadCall.credits, initialCredits, 'Credits must not be deducted on failed requests');
-  console.log(`  ✓ Passed: Credits preserved (${profileAfterBadCall.credits} credits remaining)`);
+  // 7. Concurrency & Double-Click Lock (409 Conflict on duplicate generation requests)
+  console.log('\nTest 7: Concurrency & Double-Click Lock (409 Conflict on simultaneous requests)');
+  const [req1, req2] = await Promise.all([
+    fetch(`${BASE_URL}/dreams/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dreamId, keyframeId: kfData.keyframes[0].id, dreamTitle: 'Race Test 1' })
+    }),
+    fetch(`${BASE_URL}/dreams/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dreamId, keyframeId: kfData.keyframes[0].id, dreamTitle: 'Race Test 2' })
+    })
+  ]);
+
+  const statuses = [req1.status, req2.status];
+  assert(
+    statuses.includes(409) || statuses.includes(429),
+    `Concurrent requests on same session must reject duplicate with 409 Conflict or 429 GPU Busy. Received: ${statuses.join(', ')}`
+  );
+  console.log(`  ✓ Passed: Duplicate simultaneous generation request was safely blocked with 409/429 (Statuses: ${statuses.join(', ')})`);
+
+  // 8. Credit Integrity on Failure / Execution
+  console.log('\nTest 8: Credit deduction semantics');
+  const profileAfterCalls = await (await fetch(`${BASE_URL}/user/profile`)).json();
+  // One generation was either running or completed, or rejected; credits must be >= 9
+  assert(profileAfterCalls.credits <= initialCredits, 'Credits cannot increase');
+  assert(profileAfterCalls.credits >= initialCredits - 1, 'Credits cannot decrease by more than 1');
+  console.log(`  ✓ Passed: Credits maintained safely (${profileAfterCalls.credits} credits remaining)`);
 
   console.log('\n======================================================');
   console.log('🎉 ALL ASSERTIONS PASSED! DREAM VIEWER BACKEND VERIFIED.');

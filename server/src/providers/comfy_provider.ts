@@ -23,6 +23,7 @@ export class ComfyDreamProvider implements IDreamProvider {
     videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
     easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
     steps: parseInt(process.env.WAN_STEPS || '15', 10),
+    keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '10', 10),
     width: parseInt(process.env.WAN_WIDTH || '832', 10),
     height: parseInt(process.env.WAN_HEIGHT || '480', 10),
     fps: parseInt(process.env.WAN_FPS || '24', 10),
@@ -45,9 +46,6 @@ export class ComfyDreamProvider implements IDreamProvider {
     fs.mkdirSync(this.storageKeyframesDir, { recursive: true });
   }
 
-  /**
-   * Basic sanitization for prompt strings
-   */
   private sanitizeForPrompt(text: string): string {
     return text
       .replace(/[\r\n\t]+/g, ' ')
@@ -77,221 +75,254 @@ export class ComfyDreamProvider implements IDreamProvider {
   }
 
   /**
-   * Cancel and clear a running or pending ComfyUI prompt
+   * Safe cancellation: Inspects ComfyUI /queue before interrupting.
+   * If the prompt is actively executing (queue_running), calls /interrupt.
+   * If the prompt is pending (queue_pending), deletes it from queue without interrupting other running jobs.
    */
   private async cancelComfyJob(promptId: string): Promise<void> {
-    console.log(`⚠️ [ComfyDreamProvider] Attempting to cancel/interrupt job ${promptId}...`);
+    console.log(`⚠️ [ComfyDreamProvider] Checking queue to safely cancel prompt: ${promptId}...`);
     try {
-      // 1. Interrupt actively running execution
-      await fetch(`${this.comfyHost}/interrupt`, { method: 'POST' });
-      // 2. Remove from pending queue if not started
-      await fetch(`${this.comfyHost}/queue`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ delete: [promptId] })
-      });
-      console.log(`✅ [ComfyDreamProvider] Prompt ${promptId} successfully cancelled.`);
+      const queueRes = await fetch(`${this.comfyHost}/queue`);
+      if (!queueRes.ok) return;
+
+      const queueData = (await queueRes.json()) as any;
+      const isRunning = Array.isArray(queueData.queue_running) &&
+        queueData.queue_running.some((item: any) => item[1] === promptId);
+      const isPending = Array.isArray(queueData.queue_pending) &&
+        queueData.queue_pending.some((item: any) => item[1] === promptId);
+
+      if (isRunning) {
+        console.log(`🛑 [ComfyDreamProvider] Prompt ${promptId} is actively running on GPU. Calling /interrupt...`);
+        await fetch(`${this.comfyHost}/interrupt`, { method: 'POST' });
+      } else if (isPending) {
+        console.log(`🗑️ [ComfyDreamProvider] Prompt ${promptId} is pending in queue. Deleting entry without interrupting GPU...`);
+        await fetch(`${this.comfyHost}/queue`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delete: [promptId] })
+        });
+      } else {
+        console.log(`ℹ️ [ComfyDreamProvider] Prompt ${promptId} is neither running nor pending.`);
+      }
     } catch (err: any) {
-      console.warn(`Failed to cancel ComfyUI job ${promptId}:`, err.message);
+      console.warn(`Failed to safely cancel ComfyUI job ${promptId}:`, err.message);
     }
   }
 
   /**
-   * Generate keyframe images.
-   * Leverages Wan 2.2 length:1 text-to-image mode to produce real GPU keyframes,
-   * with graceful fallback to curated anchors if ComfyUI is unavailable.
+   * Generate 100% genuine GPU keyframes using Wan 2.2 length:1 text-to-image.
+   * In Comfy mode, this does NOT fall back to Unsplash stock photos.
+   * Generates `count` distinct seeds in a single cached ComfyUI execution graph.
    */
   public async generateKeyframes(refinedPrompt: string, count: number = 3): Promise<KeyframeOption[]> {
-    console.log(`🎨 [ComfyDreamProvider] Synthesizing dream keyframes on ComfyUI (target: ${count})...`);
+    console.log(`🎨 [ComfyDreamProvider] Generating ${count} genuine GPU keyframes via Wan 2.2...`);
 
-    try {
-      const generatedKeyframes: KeyframeOption[] = [];
+    const baseSeed = Math.floor(Math.random() * 8000000000000000);
+    const kfPrompt: Record<string, any> = {
+      "37": {
+        "class_type": "UNETLoader",
+        "inputs": {
+          "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
+          "weight_dtype": "default"
+        }
+      },
+      "60": {
+        "class_type": "EasyCache",
+        "inputs": {
+          "reuse_threshold": this.config.easyCacheThreshold,
+          "start_percent": 0.15,
+          "end_percent": 0.95,
+          "verbose": false,
+          "model": ["37", 0]
+        }
+      },
+      "48": {
+        "class_type": "ModelSamplingSD3",
+        "inputs": {
+          "shift": this.config.shift,
+          "model": ["60", 0]
+        }
+      },
+      "38": {
+        "class_type": "CLIPLoader",
+        "inputs": {
+          "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+          "type": "wan",
+          "device": "default"
+        }
+      },
+      "39": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "wan2.2_vae.safetensors"
+        }
+      },
+      "6": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": this.sanitizeForPrompt(refinedPrompt),
+          "clip": ["38", 0]
+        }
+      },
+      "7": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "nsfw, nude, naked, erotic, gore, blood, violence, close-up human face, cartoon, flat lighting, blurry, low resolution, watermark",
+          "clip": ["38", 0]
+        }
+      },
+      "55": {
+        "class_type": "Wan22ImageToVideoLatent",
+        "inputs": {
+          "width": this.config.width,
+          "height": this.config.height,
+          "length": 1, // 1 frame produces a single still keyframe
+          "batch_size": 1,
+          "vae": ["39", 0]
+        }
+      }
+    };
 
-      // Generate 1 primary high-fidelity keyframe from Wan 2.2 on GPU
-      const keyframeSeed = Math.floor(Math.random() * 9007199254740991);
-      const kfPrompt: Record<string, any> = {
-        "37": {
-          "class_type": "UNETLoader",
-          "inputs": {
-            "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-            "weight_dtype": "default"
-          }
-        },
-        "60": {
-          "class_type": "EasyCache",
-          "inputs": {
-            "reuse_threshold": this.config.easyCacheThreshold,
-            "start_percent": 0.15,
-            "end_percent": 0.95,
-            "verbose": false,
-            "model": ["37", 0]
-          }
-        },
-        "48": {
-          "class_type": "ModelSamplingSD3",
-          "inputs": {
-            "shift": this.config.shift,
-            "model": ["60", 0]
-          }
-        },
-        "38": {
-          "class_type": "CLIPLoader",
-          "inputs": {
-            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-            "type": "wan",
-            "device": "default"
-          }
-        },
-        "39": {
-          "class_type": "VAELoader",
-          "inputs": {
-            "vae_name": "wan2.2_vae.safetensors"
-          }
-        },
-        "6": {
-          "class_type": "CLIPTextEncode",
-          "inputs": {
-            "text": this.sanitizeForPrompt(refinedPrompt),
-            "clip": ["38", 0]
-          }
-        },
-        "7": {
-          "class_type": "CLIPTextEncode",
-          "inputs": {
-            "text": "nsfw, nude, naked, erotic, gore, blood, violence, close-up human face, cartoon, flat lighting, blurry, low resolution, watermark",
-            "clip": ["38", 0]
-          }
-        },
-        "55": {
-          "class_type": "Wan22ImageToVideoLatent",
-          "inputs": {
-            "width": this.config.width,
-            "height": this.config.height,
-            "length": 1, // 1 frame produces a still image
-            "batch_size": 1,
-            "vae": ["39", 0]
-          }
-        },
-        "3": {
-          "class_type": "KSampler",
-          "inputs": {
-            "seed": keyframeSeed,
-            "steps": Math.min(this.config.steps, 15),
-            "cfg": this.config.cfg,
-            "sampler_name": "uni_pc",
-            "scheduler": "simple",
-            "denoise": 1,
-            "model": ["48", 0],
-            "positive": ["6", 0],
-            "negative": ["7", 0],
-            "latent_image": ["55", 0]
-          }
-        },
-        "8": {
-          "class_type": "VAEDecode",
-          "inputs": {
-            "samples": ["3", 0],
-            "vae": ["39", 0]
-          }
-        },
-        "58": {
-          "class_type": "SaveImage",
-          "inputs": {
-            "filename_prefix": "keyframe/DreamViewer",
-            "images": ["8", 0]
-          }
+    // Construct distinct KSamplers and SaveImage nodes for each keyframe in the same prompt
+    const saveNodeIds: string[] = [];
+    const seeds: number[] = [];
+
+    for (let i = 0; i < count; i++) {
+      const seed = baseSeed + (i * 1013904223);
+      seeds.push(seed);
+      const ksamplerId = `ksampler_kf_${i + 1}`;
+      const vaeDecodeId = `vaedecode_kf_${i + 1}`;
+      const saveImageId = `saveimage_kf_${i + 1}`;
+      saveNodeIds.push(saveImageId);
+
+      kfPrompt[ksamplerId] = {
+        "class_type": "KSampler",
+        "inputs": {
+          "seed": seed,
+          "steps": this.config.keyframeSteps,
+          "cfg": this.config.cfg,
+          "sampler_name": "uni_pc",
+          "scheduler": "simple",
+          "denoise": 1,
+          "model": ["48", 0],
+          "positive": ["6", 0],
+          "negative": ["7", 0],
+          "latent_image": ["55", 0]
         }
       };
 
-      const queueRes = await fetch(`${this.comfyHost}/prompt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: kfPrompt })
-      });
+      kfPrompt[vaeDecodeId] = {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": [ksamplerId, 0],
+          "vae": ["39", 0]
+        }
+      };
 
-      if (queueRes.ok) {
-        const queueData = (await queueRes.json()) as any;
-        const promptId = queueData.prompt_id;
-        
-        // Poll for keyframe completion (up to 45 seconds)
-        const kfStartTime = Date.now();
-        let kfCompleted = false;
+      kfPrompt[saveImageId] = {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": `keyframe/DreamViewer_KF_${i + 1}`,
+          "images": [vaeDecodeId, 0]
+        }
+      };
+    }
 
-        while (Date.now() - kfStartTime < 45_000) {
-          await new Promise(r => setTimeout(r, 1500));
-          const hRes = await fetch(`${this.comfyHost}/history/${promptId}`);
-          if (!hRes.ok) continue;
+    const queueRes = await fetch(`${this.comfyHost}/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: kfPrompt })
+    });
 
-          const hData = (await hRes.json()) as any;
-          if (hData && hData[promptId]?.outputs?.['58']?.images?.length > 0) {
-            const outImg = hData[promptId].outputs['58'].images[0];
-            const comfyViewUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(outImg.filename)}&subfolder=${encodeURIComponent(outImg.subfolder || '')}&type=output`;
-            
-            // Download and persist in server's storage
-            const imgRes = await fetch(comfyViewUrl);
-            if (imgRes.ok) {
-              const imgBuf = Buffer.from(await imgRes.arrayBuffer());
-              const keyframeId = `kf_gpu_${Date.now()}_1`;
-              const localFilename = `${keyframeId}.png`;
-              await fs.promises.writeFile(path.join(this.storageKeyframesDir, localFilename), imgBuf);
+    if (!queueRes.ok) {
+      const errText = await queueRes.text();
+      throw new Error(`ComfyUI rejected keyframe prompt queue (${queueRes.status}): ${errText}`);
+    }
 
-              generatedKeyframes.push({
-                id: keyframeId,
-                imageUrl: `${this.serverBaseUrl}/api/media/keyframes/${localFilename}`,
-                aspectRatio: '16:9',
-                seed: keyframeSeed,
-                isMock: false, // Real GPU generated keyframe!
-                isSelected: true
-              });
-              kfCompleted = true;
+    const queueData = (await queueRes.json()) as any;
+    const promptId = queueData.prompt_id;
+    console.log(`🚀 [ComfyDreamProvider] Keyframe prompt enqueued with ID: ${promptId}`);
+
+    // Poll for keyframe completion (up to 90 seconds for 3 keyframes)
+    const startTime = Date.now();
+    const timeoutMs = 90_000;
+    let completedItem: any = null;
+
+    try {
+      while (Date.now() - startTime < timeoutMs) {
+        await new Promise(r => setTimeout(r, 1500));
+        const hRes = await fetch(`${this.comfyHost}/history/${promptId}`);
+        if (!hRes.ok) continue;
+
+        const hData = (await hRes.json()) as any;
+        if (hData && hData[promptId]) {
+          const item = hData[promptId];
+          if (item.status?.status_str === 'error') {
+            let errMsg = 'ComfyUI execution error';
+            if (Array.isArray(item.status?.messages)) {
+              const errEntry = item.status.messages.find((m: any) => m[0] === 'execution_error');
+              if (errEntry && errEntry[1]) {
+                const { exception_message, exception_type, node_type } = errEntry[1];
+                errMsg = `${node_type || 'Node'} failed [${exception_type || 'Error'}]: ${exception_message || 'Unknown error'}`;
+              }
             }
+            throw new Error(`ComfyUI keyframe generation failed: ${errMsg}`);
+          }
+
+          if (item.outputs && Object.keys(item.outputs).length >= count) {
+            completedItem = item;
             break;
           }
         }
-
-        if (!kfCompleted) {
-          await this.cancelComfyJob(promptId);
-        }
       }
 
-      // If GPU keyframe succeeded, add it to options
-      if (generatedKeyframes.length > 0) {
-        // Also provide 2 complementary curated anchors for variety
-        const secondaryAnchors = [
-          'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1200&q=80',
-          'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80'
-        ];
-        secondaryAnchors.forEach((url, i) => {
-          generatedKeyframes.push({
-            id: `kf_anchor_${Date.now()}_${i + 2}`,
-            imageUrl: url,
-            aspectRatio: '16:9',
-            seed: Math.floor(Math.random() * 9999999),
-            isMock: true,
-            isSelected: false
-          });
-        });
-        return generatedKeyframes.slice(0, count);
+      if (!completedItem) {
+        await this.cancelComfyJob(promptId);
+        throw new Error(`ComfyUI keyframe generation timed out after ${timeoutMs / 1000} seconds.`);
       }
-    } catch (err: any) {
-      console.warn(`Keyframe GPU synthesis skipped or failed: ${err.message}. Falling back to curated anchors.`);
+    } catch (pollErr: any) {
+      if (!completedItem) {
+        await this.cancelComfyJob(promptId);
+      }
+      throw pollErr;
     }
 
-    // Fallback: curated composition anchors marked isMock: true
-    const anchorPresets = [
-      'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1200&q=80',
-      'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80',
-      'https://images.unsplash.com/photo-1534447677768-be436bb09401?auto=format&fit=crop&w=1200&q=80'
-    ];
+    // Process and persist all generated keyframe images into server storage
+    const keyframes: KeyframeOption[] = [];
+    const outputs = completedItem.outputs;
 
-    return anchorPresets.slice(0, count).map((url, index) => ({
-      id: `comfy_kf_${Date.now()}_${index + 1}`,
-      imageUrl: url,
-      aspectRatio: '16:9',
-      seed: Math.floor(Math.random() * 9999999),
-      isMock: true,
-      isSelected: index === 0
-    }));
+    for (let i = 0; i < saveNodeIds.length; i++) {
+      const nodeId = saveNodeIds[i];
+      const nodeOut = outputs[nodeId];
+      if (!nodeOut || !nodeOut.images || nodeOut.images.length === 0) {
+        throw new Error(`Expected image output missing for keyframe node ${nodeId}`);
+      }
+
+      const outImg = nodeOut.images[0];
+      const comfyViewUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(outImg.filename)}&subfolder=${encodeURIComponent(outImg.subfolder || '')}&type=output`;
+
+      const imgRes = await fetch(comfyViewUrl);
+      if (!imgRes.ok) {
+        throw new Error(`Failed to download keyframe image ${outImg.filename} from ComfyUI (${imgRes.status})`);
+      }
+
+      const imgBuf = Buffer.from(await imgRes.arrayBuffer());
+      const keyframeId = `kf_gpu_${Date.now()}_${i + 1}`;
+      const localFilename = `${keyframeId}.png`;
+      await fs.promises.writeFile(path.join(this.storageKeyframesDir, localFilename), imgBuf);
+
+      keyframes.push({
+        id: keyframeId,
+        imageUrl: `${this.serverBaseUrl}/api/media/keyframes/${localFilename}`,
+        aspectRatio: '16:9',
+        seed: seeds[i],
+        isMock: false, // 100% genuine GPU generated keyframe!
+        isSelected: i === 0
+      });
+    }
+
+    console.log(`✅ [ComfyDreamProvider] Successfully generated and stored ${keyframes.length} GPU keyframes.`);
+    return keyframes;
   }
 
   /**
@@ -527,12 +558,10 @@ export class ComfyDreamProvider implements IDreamProvider {
       }
 
       if (!completedHistory) {
-        // Timeout reached: actively cancel the job so it does not jam ComfyUI
         await this.cancelComfyJob(promptId);
         throw new Error(`ComfyUI video generation timed out after ${timeoutMs / 1000} seconds. Job cancelled.`);
       }
     } catch (pollErr: any) {
-      // Ensure job is cancelled on any unexpected abortion
       if (!completedHistory) {
         await this.cancelComfyJob(promptId);
       }
