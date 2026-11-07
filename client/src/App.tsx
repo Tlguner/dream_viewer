@@ -4,7 +4,7 @@ import { DreamInputStep } from './components/DreamInputStep';
 import { KeyframeReviewStep } from './components/KeyframeReviewStep';
 import { DreamPlayerStep } from './components/DreamPlayerStep';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000/api';
 
 type Step = 'INPUT' | 'KEYFRAMES' | 'PLAYER';
 
@@ -15,12 +15,15 @@ export function App() {
   const [isLoadingVideo, setIsLoadingVideo] = useState(false);
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Initial provider info starts in honest mock/detecting state so it never falsely flashes GPU
   const [providerInfo, setProviderInfo] = useState<{ name: string; isMock: boolean }>({
-    name: 'Local Provider',
-    isMock: false
+    name: 'Detecting Provider...',
+    isMock: true
   });
 
-  // Dream pipeline state
+  // Stateful dream pipeline
+  const [currentDreamId, setCurrentDreamId] = useState<string | null>(null);
   const [analysisData, setAnalysisData] = useState<any>(null);
   const [keyframes, setKeyframes] = useState<any[]>([]);
   const [, setSelectedKeyframe] = useState<any>(null);
@@ -68,13 +71,15 @@ export function App() {
         throw new Error(data.message || 'Dream moderation check failed.');
       }
 
+      const dreamId = data.dreamId;
+      setCurrentDreamId(dreamId);
       setAnalysisData(data.data);
 
-      // Immediately trigger Keyframe generation
+      // Step 2: Trigger Keyframe generation using server-locked dreamId
       const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refinedPrompt: data.data.refinedPrompt, count: 3 })
+        body: JSON.stringify({ dreamId, count: 3 })
       });
 
       const kfData = await kfRes.json();
@@ -91,16 +96,16 @@ export function App() {
     }
   };
 
-  // Regenerate keyframes
+  // Regenerate keyframes using server-side session
   const handleRegenerateKeyframes = async () => {
-    if (!analysisData) return;
+    if (!currentDreamId) return;
     setIsRegenerating(true);
 
     try {
       const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refinedPrompt: analysisData.refinedPrompt, count: 3 })
+        body: JSON.stringify({ dreamId: currentDreamId, count: 3 })
       });
 
       const kfData = await kfRes.json();
@@ -115,17 +120,17 @@ export function App() {
     }
   };
 
-  // Step 2: Animate Approved Keyframe into Video
+  // Step 3: Animate Approved Keyframe into Video via server-locked IDs
   const handleAnimate = async (keyframe: any) => {
+    if (!currentDreamId) return;
     setIsLoadingVideo(true);
     try {
       const res = await fetch(`${API_BASE}/dreams/generate-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          selectedKeyframeUrl: keyframe.imageUrl,
-          prompt: analysisData?.refinedPrompt || '',
-          cameraMotion: analysisData?.cameraMotion || '',
+          dreamId: currentDreamId,
+          keyframeId: keyframe.id,
           dreamTitle: 'Lucid Vision'
         })
       });
@@ -154,6 +159,7 @@ export function App() {
   // Reset for a new dream
   const handleNewDream = () => {
     setStep('INPUT');
+    setCurrentDreamId(null);
     setAnalysisData(null);
     setKeyframes([]);
     setSelectedKeyframe(null);

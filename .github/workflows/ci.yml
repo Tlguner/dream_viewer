@@ -40,3 +40,15 @@ jobs:
         run: |
           cd server
           npm run build
+
+      - name: Run Backend Integration & Moderation Verification Tests
+        env:
+          DREAM_PROVIDER: mock
+          PORT: 5000
+          HOST: 127.0.0.1
+        run: |
+          cd server
+          node dist/index.js &
+          sleep 3
+          cd ..
+          node test_api.mjs

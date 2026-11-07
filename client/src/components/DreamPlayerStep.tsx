@@ -10,7 +10,8 @@ import {
   Film, 
   Sliders, 
   Layers,
-  AlertTriangle
+  AlertTriangle,
+  Check
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { ambientSound } from '../audio/ambientEngine';
@@ -21,6 +22,7 @@ interface DreamVideoData {
   durationSeconds: number;
   effectiveSeconds: number;
   fps: number;
+  playbackRate?: number;
   faceBlurred: boolean;
   audioMood: string;
   shaderPreset: string;
@@ -48,7 +50,9 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
   const [isPlaying, setIsPlaying] = useState(true);
   const [currentShader, setCurrentShader] = useState<ShaderPreset>('dream_haze');
   const [isOnTwos, setIsOnTwos] = useState(true);
-  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ message: string; isError?: boolean } | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [copiedShare, setCopiedShare] = useState(false);
 
   // Trigger celebration confetti & ambient audio on mount
   useEffect(() => {
@@ -65,9 +69,12 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
   // Update playback rate dynamically when on-twos changes
   useEffect(() => {
     if (videoRef.current) {
-      videoRef.current.playbackRate = isOnTwos ? 0.5 : 1.0;
+      // If video is native 24fps, on-twos runs at 0.5x speed (12fps flipbook).
+      // If video is native 12fps, it runs at 1.0x speed.
+      const targetRate = isOnTwos ? (dream.video.playbackRate || 0.5) : 1.0;
+      videoRef.current.playbackRate = targetRate;
     }
-  }, [isOnTwos]);
+  }, [isOnTwos, dream.video.playbackRate]);
 
   const togglePlay = () => {
     if (!videoRef.current) return;
@@ -80,12 +87,69 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
     }
   };
 
-  const handleExport = () => {
-    setExportNotice("Baking video with ambient audio & shader filters via server FFmpeg...");
-    setTimeout(() => {
-      setExportNotice("Your dream MP4 is ready! Download triggered.");
-      setTimeout(() => setExportNotice(null), 4000);
-    }, 1800);
+  // REAL Export: Downloads the actual MP4 file to the user's computer
+  const handleExport = async () => {
+    try {
+      setIsExporting(true);
+      setNotice({ message: 'Fetching video stream for download...' });
+
+      const response = await fetch(dream.video.videoUrl);
+      if (!response.ok) throw new Error('Video stream unreachable');
+
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const safeTitle = (dream.title || 'dream').toLowerCase().replace(/[^a-z0-9]/g, '_');
+      const filename = `${safeTitle}_${dream.id || Date.now()}.mp4`;
+
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+
+      setNotice({ message: `Downloaded: ${filename}` });
+      setTimeout(() => setNotice(null), 4000);
+    } catch (err: any) {
+      console.warn('Direct blob download failed, falling back to window open:', err.message);
+      // Direct stream fallback for cross-origin or local video server
+      window.open(dream.video.videoUrl, '_blank');
+      setNotice({ message: 'Opening video directly in new browser tab...' });
+      setTimeout(() => setNotice(null), 4000);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // REAL Share: Copies the actual dream video URL or invokes Native Web Share API
+  const handleShare = async () => {
+    const videoUrl = dream.video.videoUrl;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: dream.title || 'My AI Lucid Dream',
+          text: `Check out my lucid dream visualized with DreamViewer: "${dream.prompt}"`,
+          url: videoUrl
+        });
+        return;
+      } catch (err) {
+        // Fallback to clipboard if user dismissed native share dialog
+      }
+    }
+
+    try {
+      await navigator.clipboard.writeText(videoUrl);
+      setCopiedShare(true);
+      setNotice({ message: 'Direct MP4 video URL copied to clipboard!' });
+      setTimeout(() => {
+        setNotice(null);
+        setCopiedShare(false);
+      }, 3500);
+    } catch (e) {
+      setNotice({ message: `Share URL: ${videoUrl}` });
+      setTimeout(() => setNotice(null), 4000);
+    }
   };
 
   const getShaderClass = () => {
@@ -101,6 +165,11 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
     }
   };
 
+  const rawSeconds = dream.video.durationSeconds || 5;
+  const effectiveSeconds = dream.video.effectiveSeconds || (rawSeconds * 2);
+  const displayDuration = isOnTwos ? effectiveSeconds : rawSeconds;
+  const displayFps = isOnTwos ? 12 : (dream.video.fps || 24);
+
   return (
     <div className="max-w-4xl mx-auto px-4 py-8 animate-fadeIn">
       
@@ -114,7 +183,7 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
           {dream.title}
         </h1>
         <p className="text-xs md:text-sm text-slate-400 max-w-lg mx-auto">
-          Played "on-twos" (12fps stutter) doubling runtime from 5s to 10s at zero extra compute.
+          Played "on-twos" (12fps stutter) doubling runtime from {rawSeconds}s to {effectiveSeconds}s at zero extra compute.
         </p>
       </div>
 
@@ -123,7 +192,7 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
         <div className="mb-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
           <span>
-            <strong>Simulation / Test Output:</strong> This is a placeholder demonstration video because real AI models are not active.
+            <strong>Simulation / Test Output:</strong> This is a placeholder demonstration video because real AI models were bypassed or run in test mode.
           </span>
         </div>
       )}
@@ -151,7 +220,7 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
           <div className="absolute top-3 left-3 right-3 flex items-center justify-between text-xs pointer-events-none">
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-md text-purple-300 border border-purple-500/30">
               <Film className="w-3.5 h-3.5 text-cyan-400" />
-              <span>{isOnTwos ? '10s On-Twos (12fps)' : '5s Native (24fps)'}</span>
+              <span>{displayDuration}s {isOnTwos ? 'On-Twos' : 'Native'} ({displayFps}fps)</span>
             </div>
 
             {/* Honest Security Badge: Only show if face blur ACTUALLY executed */}
@@ -237,11 +306,19 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
 
       </div>
 
-      {/* Export Toast if active */}
-      {exportNotice && (
-        <div className="mb-6 p-4 rounded-xl bg-purple-900/40 border border-purple-500/50 text-purple-200 text-xs flex items-center gap-3 animate-fadeIn">
-          <div className="w-4 h-4 border-2 border-purple-300 border-t-transparent rounded-full animate-spin shrink-0" />
-          <span>{exportNotice}</span>
+      {/* Real Export & Download Notification Toast */}
+      {notice && (
+        <div className={`mb-6 p-4 rounded-xl border text-xs flex items-center gap-3 animate-fadeIn ${
+          notice.isError 
+            ? 'bg-red-950/40 border-red-500/50 text-red-200'
+            : 'bg-purple-900/40 border-purple-500/50 text-purple-200'
+        }`}>
+          {isExporting ? (
+            <div className="w-4 h-4 border-2 border-purple-300 border-t-transparent rounded-full animate-spin shrink-0" />
+          ) : (
+            <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+          )}
+          <span>{notice.message}</span>
         </div>
       )}
 
@@ -249,32 +326,23 @@ export const DreamPlayerStep: React.FC<DreamPlayerStepProps> = ({ dream, onNewDr
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4 glass-panel p-4 rounded-xl">
         
         <div className="flex items-center gap-2">
+          {/* Real Export Button */}
           <button
             onClick={handleExport}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-purple-950 transition-all active:scale-95"
+            disabled={isExporting}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-purple-950 transition-all active:scale-95 disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
-            <span>Export & Share MP4</span>
+            <span>{isExporting ? 'Exporting...' : 'Export MP4'}</span>
           </button>
 
+          {/* Real Share Button */}
           <button
-            onClick={() => {
-              if (navigator.share) {
-                navigator.share({
-                  title: 'My Dream Video',
-                  text: 'Check out the dream I visualized with DreamViewer!',
-                  url: window.location.href
-                }).catch(() => {});
-              } else {
-                navigator.clipboard.writeText(window.location.href);
-                setExportNotice("Link copied to clipboard for sharing!");
-                setTimeout(() => setExportNotice(null), 3000);
-              }
-            }}
-            className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs transition-all"
+            onClick={handleShare}
+            className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs transition-all active:scale-95"
           >
-            <Share2 className="w-4 h-4" />
-            <span>Share</span>
+            {copiedShare ? <Check className="w-4 h-4 text-emerald-400" /> : <Share2 className="w-4 h-4" />}
+            <span>{copiedShare ? 'Copied!' : 'Share Video'}</span>
           </button>
         </div>
 

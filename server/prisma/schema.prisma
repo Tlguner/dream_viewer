@@ -78,7 +78,7 @@ model VideoClip {
   durationSeconds  Int      @default(5)
   effectiveSeconds Int      @default(10) // Played "on-twos"
   fps              Int      @default(12)
-  faceBlurred      Boolean  @default(true)
+  faceBlurred      Boolean  @default(false)
   audioMood        String   @default("ambient_binaural")
   createdAt        DateTime @default(now())
 

@@ -8,7 +8,8 @@ import {
 import { SafetyShield } from '../moderation/shield.js';
 
 export class MockDreamProvider implements IDreamProvider {
-  public name = 'MockDreamProvider';
+  public name = 'MockDreamProvider (Simulation)';
+  public isMock = true;
 
   private mockKeyframes: Record<MoodStyle, string[]> = {
     ETHEREAL_LUCID: [
@@ -44,19 +45,25 @@ export class MockDreamProvider implements IDreamProvider {
   };
 
   private mockVideos: string[] = [
-    // Beautiful ethereal high-res open-access video loops
     'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
     'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
   ];
 
-  public async analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis> {
-    // Simulate LLM latency
-    await new Promise(r => setTimeout(r, 1200));
+  private sanitizeForPrompt(text: string): string {
+    return text
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/[\\"{}[\]]/g, '')
+      .replace(/\b(ignore previous|system prompt|jailbreak)\b/gi, '')
+      .trim();
+  }
 
+  public async analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis> {
+    await new Promise(r => setTimeout(r, 600));
+
+    const cleanInput = this.sanitizeForPrompt(rawText);
     const detectedMood = moodHint || 'ETHEREAL_LUCID';
 
-    // Cinematic prompt refinement
-    const refinedPrompt = `Surreal ethereal dreamscape: ${rawText}. Volumetric fog, chromatic light scattering, anamorphic lens flare, deep cosmic haze, solitary silhouette seen strictly from behind in shadows, no visible human face, magical realism, 35mm film grain, 8k cinematic masterpiece.`;
+    const refinedPrompt = `Surreal ethereal dreamscape: ${cleanInput}. Volumetric fog, chromatic light scattering, anamorphic lens flare, deep cosmic haze, solitary silhouette seen strictly from behind in shadows, no visible human face, magical realism, 35mm film grain, 8k cinematic masterpiece.`;
     
     const cameraMotion = 'Slow forward dolly tracking push with hypnotic subtle rotational tilt and floating weightlessness';
 
@@ -74,10 +81,8 @@ export class MockDreamProvider implements IDreamProvider {
   }
 
   public async generateKeyframes(refinedPrompt: string, count: number = 3): Promise<KeyframeOption[]> {
-    // Simulate image generation latency (2 seconds)
-    await new Promise(r => setTimeout(r, 1800));
+    await new Promise(r => setTimeout(r, 800));
 
-    // Choose keyframe pack based on prompt content
     let mood: MoodStyle = 'ETHEREAL_LUCID';
     const lower = refinedPrompt.toLowerCase();
     if (lower.includes('cyber') || lower.includes('neon') || lower.includes('city')) mood = 'SURREAL_CYBERPUNK';
@@ -89,31 +94,33 @@ export class MockDreamProvider implements IDreamProvider {
     const images = this.mockKeyframes[mood] || this.mockKeyframes.ETHEREAL_LUCID;
 
     return images.slice(0, count).map((url, index) => ({
-      id: `kf_${Date.now()}_${index + 1}`,
+      id: `mock_kf_${Date.now()}_${index + 1}`,
       imageUrl: url,
       aspectRatio: '16:9',
       seed: Math.floor(Math.random() * 9999999),
+      isMock: true,
       isSelected: index === 0
     }));
   }
 
   public async generateVideo(
-    selectedKeyframeUrl: string, 
+    selectedKeyframe: KeyframeOption, 
     prompt: string, 
     cameraMotion: string
   ): Promise<DreamVideoResult> {
-    // Simulate video generation (3 seconds) + server face-anonymization pass
-    await new Promise(r => setTimeout(r, 2800));
+    await new Promise(r => setTimeout(r, 1200));
 
     return {
-      id: `vid_${Date.now()}`,
+      id: `mock_vid_${Date.now()}`,
       videoUrl: this.mockVideos[0],
-      durationSeconds: 5,        // Simulated API duration (5s)
-      effectiveSeconds: 10,      // Spider-Verse on-twos extended duration (10s)
-      fps: 12,                   // 12fps "animated on twos"
+      durationSeconds: 5,        // 5 seconds native at 24fps
+      effectiveSeconds: 10,      // 10 seconds played on-twos (0.5x speed / 12fps)
+      fps: 24,                   // native export 24fps
+      playbackRate: 0.5,         // client plays at 0.5x for flipbook on-twos
       faceBlurred: false,        // Face blur did not run in mock mode
       audioMood: 'ethereal_lucid_pad',
-      shaderPreset: 'dream_haze'
+      shaderPreset: 'dream_haze',
+      isMock: true
     };
   }
 }

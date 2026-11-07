@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { CheckCircle2, Video, RefreshCw, Camera, Sparkles, ShieldCheck, Eye, ArrowLeft } from 'lucide-react';
+import { CheckCircle2, Video, RefreshCw, Camera, Sparkles, ShieldCheck, Eye, ArrowLeft, Info } from 'lucide-react';
 
 interface Keyframe {
   id: string;
   imageUrl: string;
   aspectRatio: string;
   seed: number;
+  isMock?: boolean;
   isSelected?: boolean;
 }
 
@@ -50,6 +51,7 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
   };
 
   const selectedKf = keyframes.find(k => k.id === selectedId) || keyframes[0];
+  const hasMockKeyframes = keyframes.some(k => k.isMock);
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-8 animate-fadeIn">
@@ -69,6 +71,16 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
           <span>Stage 2: Keyframe Selection</span>
         </div>
       </div>
+
+      {/* Honest Mock/Anchor Notification Banner */}
+      {hasMockKeyframes && (
+        <div className="mb-6 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2.5">
+          <Info className="w-4 h-4 text-amber-400 shrink-0" />
+          <span>
+            <strong>Curated Composition Anchors:</strong> Preview keyframes are artistic anchors. When you approve a frame, its image will be directly uploaded to Wan 2.2 on your GPU for Image-to-Video synthesis.
+          </span>
+        </div>
+      )}
 
       {/* Dream Architect Structured Breakdown Card */}
       <div className="glass-panel rounded-2xl p-5 mb-8 border border-purple-500/30">
@@ -109,7 +121,7 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
               Select Your Dream Anchor
             </h2>
             <p className="text-xs text-slate-400">
-              Only the approved frame will be animated to video, keeping generation quality high and costs low.
+              Only the approved frame will be animated into video, ensuring maximum fidelity at minimum compute.
             </p>
           </div>
 
@@ -137,12 +149,19 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
                 }`}
               >
                 {/* Image */}
-                <div className="aspect-video w-full bg-slate-900 overflow-hidden">
+                <div className="aspect-video w-full bg-slate-900 overflow-hidden relative">
                   <img
                     src={kf.imageUrl}
                     alt={`Dream Keyframe ${index + 1}`}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                   />
+
+                  {/* Honest Indicator if Mock / Simulated */}
+                  {kf.isMock && (
+                    <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur-md border border-amber-500/40 text-[10px] font-mono text-amber-300">
+                      SIMULATED ANCHOR
+                    </div>
+                  )}
                 </div>
 
                 {/* Selection Badge */}
@@ -186,7 +205,7 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
           {isLoadingVideo ? (
             <>
               <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              <span>Manifesting Dream Video...</span>
+              <span>Manifesting Dream Video via Wan 2.2 I2V...</span>
             </>
           ) : (
             <>
