@@ -64,9 +64,16 @@ export class ComfyDreamProvider implements IDreamProvider {
   private get config() {
     if (process.env.NODE_ENV !== 'production') {
       try {
-        const rootEnv = path.resolve(this.storageVideosDir, '..', '..', '.env');
-        if (fs.existsSync(rootEnv)) {
-          dotenv.config({ path: rootEnv, override: true });
+        const candidatePaths = [
+          path.resolve(this.storageVideosDir, '..', '..', '..', '.env'), // project root (dream_viewer/.env)
+          path.resolve(this.storageVideosDir, '..', '..', '.env'),       // server directory (server/.env)
+          path.resolve(process.cwd(), '..', '.env'),
+          path.resolve(process.cwd(), '.env'),
+        ];
+        for (const envPath of candidatePaths) {
+          if (fs.existsSync(envPath)) {
+            dotenv.config({ path: envPath, override: true });
+          }
         }
       } catch {
         // fallback to existing process.env
@@ -74,7 +81,7 @@ export class ComfyDreamProvider implements IDreamProvider {
     }
 
     return {
-      videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
+      videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '121', 10),
       videoTimeoutMs: parseInt(process.env.WAN_VIDEO_TIMEOUT_MS || '900000', 10),
       easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
       steps: parseInt(process.env.WAN_STEPS || '15', 10),
