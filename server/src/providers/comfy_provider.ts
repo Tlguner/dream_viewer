@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import dotenv from 'dotenv';
 import { 
   IDreamProvider, 
   DreamPromptAnalysis, 
@@ -18,18 +19,29 @@ export class ComfyDreamProvider implements IDreamProvider {
   private storageVideosDir: string;
   private storageKeyframesDir: string;
 
-  // Configurable Wan 2.2 parameters
-  private config = {
-    videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
-    easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
-    steps: parseInt(process.env.WAN_STEPS || '15', 10),
-    keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '10', 10),
-    width: parseInt(process.env.WAN_WIDTH || '832', 10),
-    height: parseInt(process.env.WAN_HEIGHT || '480', 10),
-    fps: parseInt(process.env.WAN_FPS || '24', 10),
-    shift: parseFloat(process.env.WAN_SHIFT || '8.0'),
-    cfg: parseFloat(process.env.WAN_CFG || '5.0'),
-  };
+  // Dynamically load Wan 2.2 parameters so .env edits apply immediately without server restart
+  private get config() {
+    try {
+      const rootEnv = path.resolve(this.storageVideosDir, '..', '..', '.env');
+      if (fs.existsSync(rootEnv)) {
+        dotenv.config({ path: rootEnv, override: true });
+      }
+    } catch {
+      // fallback to existing process.env
+    }
+
+    return {
+      videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
+      easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
+      steps: parseInt(process.env.WAN_STEPS || '15', 10),
+      keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '10', 10),
+      width: parseInt(process.env.WAN_WIDTH || '832', 10),
+      height: parseInt(process.env.WAN_HEIGHT || '480', 10),
+      fps: parseInt(process.env.WAN_FPS || '24', 10),
+      shift: parseFloat(process.env.WAN_SHIFT || '8.0'),
+      cfg: parseFloat(process.env.WAN_CFG || '5.0'),
+    };
+  }
 
   constructor(
     comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188',
@@ -463,6 +475,7 @@ export class ComfyDreamProvider implements IDreamProvider {
     // 3. Build Wan 2.2 5B + EasyCache Image-to-Video Graph with configured parameters
     const seed = Math.floor(Math.random() * 9007199254740991);
     const { videoFrames, easyCacheThreshold, steps, width, height, fps, shift, cfg } = this.config;
+    console.log(`🎬 [ComfyDreamProvider] Configured Video: ${videoFrames} frames (~${(videoFrames / fps).toFixed(1)}s raw, ~${((videoFrames / fps) * 2).toFixed(1)}s on-twos) @ ${fps}fps (${width}x${height}, ${steps} steps)`);
 
     const workflowPrompt: Record<string, any> = {
       "37": {
@@ -684,8 +697,8 @@ export class ComfyDreamProvider implements IDreamProvider {
 
     // 8. Construct self-hosted server media URL
     const serverMediaUrl = `${this.serverBaseUrl}/api/media/videos/${localVideoFilename}`;
-    const nativeDuration = Math.max(1, Math.round(videoFrames / fps)); // e.g. 49 / 24 = ~2s
-    const effectiveDuration = nativeDuration * 2;                      // e.g. ~4s on-twos
+    const nativeDuration = Number((videoFrames / fps).toFixed(1));
+    const effectiveDuration = Number((nativeDuration * 2).toFixed(1));
 
     console.log(`🎬 [ComfyDreamProvider] Serving video from: ${serverMediaUrl}`);
 
