@@ -95,6 +95,32 @@ async function runApiVerification() {
   const dreamData = await dreamRes.json();
   assert(dreamData.dreamId, 'Server must return a locked dreamId');
   assert(dreamData.data.refinedPrompt, 'Server must return refinedPrompt');
+  assert(Array.isArray(dreamData.data.scenes), 'Server must return scenes array');
+  assert(dreamData.data.scenes.length >= 1 && dreamData.data.scenes.length <= 3, 'Scenes count must be 1 to 3');
+  assert(typeof dreamData.data.totalEstimatedSeconds === 'number', 'totalEstimatedSeconds must be number');
+  const sc1 = dreamData.data.scenes[0];
+  assert(sc1.sceneNumber === 1, 'First scene number must be 1');
+  assert(typeof sc1.summary === 'string' && sc1.summary.length > 0, 'Scene summary required');
+  assert(typeof sc1.keyframePrompt === 'string' && sc1.keyframePrompt.length > 0, 'Scene keyframePrompt required');
+  assert(typeof sc1.motionPrompt === 'string' && sc1.motionPrompt.length > 0, 'Scene motionPrompt required');
+  console.log(`  ✓ Passed: Dream Architect returned ${dreamData.data.scenes.length} structured scene(s) with ${dreamData.data.totalEstimatedSeconds}s estimated`);
+
+  // 4a-2: Multi-scene spatial transition test
+  const multiSceneRes = await fetch(`${BASE_URL}/dreams/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      rawDreamText: 'Derin sularda yüzüyordum, kendimi sisli bir çam ormanında buldum',
+      moodHint: 'DEEP_OCEAN'
+    })
+  });
+  assert.strictEqual(multiSceneRes.status, 200);
+  const multiData = await multiSceneRes.json();
+  assert.strictEqual(multiData.data.scenes.length, 2, 'Must decompose Ocean -> Forest transition into exactly 2 scenes');
+  assert.strictEqual(multiData.data.scenes[0].sceneNumber, 1);
+  assert.strictEqual(multiData.data.scenes[1].sceneNumber, 2);
+  console.log(`  ✓ Passed: Spatial transition (Ocean -> Forest) accurately decomposed into 2 distinct scenes`);
+
   const dreamId = dreamData.dreamId;
   console.log(`  ✓ Passed: Session created with dreamId=${dreamId}`);
 

@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { SafetyShield } from './moderation/shield.js';
 import { MockDreamProvider } from './providers/mock_provider.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
+import { IDreamArchitect, OpenAICompatibleArchitect, MockDreamArchitect } from './architect/index.js';
 import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent } from './types/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -54,6 +55,26 @@ app.use(cors({
 // Body parser with 100kb limit
 app.use(express.json({ limit: '100kb' }));
 
+// Strict Architect Resolution (No silent fallback!)
+const architectType = (process.env.ARCHITECT_PROVIDER || (process.env.DREAM_PROVIDER === 'mock' ? 'mock' : 'openai_compat')).toLowerCase().trim();
+let dreamArchitect: IDreamArchitect;
+
+if (architectType === 'openai_compat') {
+  dreamArchitect = new OpenAICompatibleArchitect(
+    process.env.ARCHITECT_BASE_URL,
+    process.env.ARCHITECT_MODEL,
+    process.env.ARCHITECT_API_KEY,
+    parseInt(process.env.ARCHITECT_TIMEOUT_MS || '60000', 10)
+  );
+} else if (architectType === 'mock') {
+  dreamArchitect = new MockDreamArchitect();
+} else {
+  throw new Error(
+    `[CRITICAL STARTUP ERROR] Unknown ARCHITECT_PROVIDER="${architectType}". ` +
+    `Supported architect providers: "openai_compat", "mock". Silent fallback has been disabled.`
+  );
+}
+
 // Strict Provider Resolution: No silent fallback!
 const providerType = (process.env.DREAM_PROVIDER || 'comfy').toLowerCase().trim();
 let dreamProvider: IDreamProvider;
@@ -62,9 +83,9 @@ const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
 
 if (providerType === 'comfy') {
   const comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188';
-  dreamProvider = new ComfyDreamProvider(comfyHost, SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR);
+  dreamProvider = new ComfyDreamProvider(comfyHost, SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR, dreamArchitect);
 } else if (providerType === 'mock') {
-  dreamProvider = new MockDreamProvider(SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR, FIXTURES_DIR);
+  dreamProvider = new MockDreamProvider(SERVER_BASE_URL, STORAGE_VIDEOS_DIR, STORAGE_KEYFRAMES_DIR, FIXTURES_DIR, dreamArchitect);
 } else {
   throw new Error(
     `[CRITICAL STARTUP ERROR] Unknown DREAM_PROVIDER="${providerType}". ` +
@@ -178,13 +199,15 @@ const GenerateVideoSchema = z.object({
   dreamTitle: z.string().max(100).optional()
 });
 
-// Health check with honest provider info
+// Health check with honest provider and architect info
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'online',
     timestamp: new Date().toISOString(),
     provider: dreamProvider.name,
     providerType,
+    architect: dreamArchitect.name,
+    architectType,
     isMock: dreamProvider.isMock,
     isGpuBusy,
     environment: process.env.NODE_ENV || 'development'
@@ -318,6 +341,8 @@ app.post('/api/dreams/analyze', async (req, res) => {
       negativePrompt: analysis.negativePrompt,
       cameraMotion: analysis.cameraMotion,
       mood: analysis.detectedMood,
+      scenes: analysis.scenes,
+      totalEstimatedSeconds: analysis.totalEstimatedSeconds,
       keyframes: [],
       status: 'analyzed',
       createdAt: new Date().toISOString(),

@@ -13,13 +13,32 @@ export interface ModerationResult {
   sanitizedPrompt?: string;
 }
 
+export interface DreamScenePlan {
+  sceneNumber: number;
+  summary: string;
+  mood: MoodStyle;
+  keyframePrompt: string;
+  motionPrompt: string;
+  cameraMotion: string;
+}
+
+export interface DreamArchitectResponse {
+  safety: {
+    allowed: boolean;
+    category: string | null;
+  };
+  scenes: DreamScenePlan[];
+}
+
 export interface DreamPromptAnalysis {
-  refinedPrompt: string;       // Legacy / unified prompt
-  keyframePrompt: string;      // Dedicated scene composition & sharp visual subject prompt
-  motionPrompt: string;        // Dedicated temporal animation & camera motion prompt
+  refinedPrompt: string;       // Legacy / unified prompt (mapped to scenes[0].keyframePrompt)
+  keyframePrompt: string;      // Primary scene composition prompt (scenes[0].keyframePrompt)
+  motionPrompt: string;        // Primary scene motion prompt (scenes[0].motionPrompt)
   negativePrompt: string;
   cameraMotion: string;
   detectedMood: MoodStyle;
+  scenes: DreamScenePlan[];    // Multi-scene storyboard decomposition (1-3 scenes)
+  totalEstimatedSeconds: number; // Server-calculated duration
   visualElements: {
     setting: string;
     surrealTwist: string;
@@ -59,6 +78,8 @@ export interface DreamSession {
   negativePrompt: string;
   cameraMotion: string;
   mood: MoodStyle;
+  scenes: DreamScenePlan[];
+  totalEstimatedSeconds: number;
   keyframes: KeyframeOption[];
   video?: DreamVideoResult;
   status: 'draft' | 'analyzed' | 'keyframes_ready' | 'generating' | 'completed' | 'failed';

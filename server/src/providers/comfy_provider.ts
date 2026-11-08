@@ -12,6 +12,7 @@ import {
   ProgressCallback
 } from '../types/index.js';
 import { SafetyShield } from '../moderation/shield.js';
+import { IDreamArchitect, OpenAICompatibleArchitect } from '../architect/index.js';
 
 export class ComfyDreamProvider implements IDreamProvider {
   public name = 'ComfyUI (Wan 2.2 5B + EasyCache GPU)';
@@ -23,6 +24,7 @@ export class ComfyDreamProvider implements IDreamProvider {
   private clientId: string = 'dream_viewer_' + crypto.randomUUID().substring(0, 8);
   private ws: any = null;
   private wsListeners: Set<(msg: any) => void> = new Set();
+  private architect: IDreamArchitect;
 
   private ensureWebSocket(): void {
     if (this.ws && (this.ws.readyState === 1 || this.ws.readyState === 0)) {
@@ -98,12 +100,14 @@ export class ComfyDreamProvider implements IDreamProvider {
     comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188',
     serverBaseUrl = process.env.SERVER_BASE_URL || 'http://127.0.0.1:5000',
     storageVideosDir = path.resolve('storage', 'videos'),
-    storageKeyframesDir = path.resolve('storage', 'keyframes')
+    storageKeyframesDir = path.resolve('storage', 'keyframes'),
+    architect?: IDreamArchitect
   ) {
     this.comfyHost = comfyHost.replace(/\/$/, '');
     this.serverBaseUrl = serverBaseUrl.replace(/\/$/, '');
     this.storageVideosDir = storageVideosDir;
     this.storageKeyframesDir = storageKeyframesDir;
+    this.architect = architect || new OpenAICompatibleArchitect();
 
     fs.mkdirSync(this.storageVideosDir, { recursive: true });
     fs.mkdirSync(this.storageKeyframesDir, { recursive: true });
@@ -119,94 +123,72 @@ export class ComfyDreamProvider implements IDreamProvider {
 
   public async analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis> {
     const cleanText = this.sanitizeForPrompt(rawText);
-    const detectedMood: MoodStyle = moodHint || 'ETHEREAL_LUCID';
 
-    let keyframePrompt = '';
-    let motionPrompt = '';
-    let cameraMotion = '';
-    let visualElements = {
-      setting: '',
-      surrealTwist: '',
-      lighting: ''
-    };
-
-    switch (detectedMood) {
-      case 'SURREAL_CYBERPUNK':
-        keyframePrompt = `${cleanText}. Cyberpunk aesthetic, intense high-contrast cinematic lighting, vibrant neon color grading with electric cyan, ultraviolet, and hot magenta accents, sharp geometric clarity, polished wet surfaces with clean glossy reflections, deep atmospheric shadows, photorealistic cinematic detail.`;
-        motionPrompt = `Smooth fluid tracking camera push through the scene: ${cleanText}. Ambient neon illumination subtly pulsing, soft shimmering wet reflections, atmospheric light bloom, continuous smooth 24fps cinematic motion.`;
-        cameraMotion = 'Smooth forward tracking push with dynamic low-angle glide';
-        visualElements = {
-          setting: 'Cyberpunk dreamscape with intense atmospheric depth',
-          surrealTwist: 'High-contrast luminescence and glossy wet surface reflections',
-          lighting: 'Vibrant neon color grading with cyan, ultraviolet, and magenta rim glow'
-        };
-        break;
-
-      case 'NOSTALGIC_FOG':
-        keyframePrompt = `${cleanText}. Vintage 35mm film still, nostalgic cinema aesthetic, muted pastel color palette, soft gentle rim lighting, clean focal composition, delicate natural film grain, evocative dreamlike atmosphere, photorealistic depth.`;
-        motionPrompt = `Slow contemplative camera push through the scene: ${cleanText}. Soft atmospheric dust motes gently drifting, subtle ambient light shifting, calm serene motion, 24fps.`;
-        cameraMotion = 'Slow contemplative dolly tracking push';
-        visualElements = {
-          setting: 'Atmospheric dreamscape with nostalgic depth',
-          surrealTwist: 'Dreamlike memories suspended in soft atmospheric light',
-          lighting: 'Muted warm dawn glow with soft cinematic shadows'
-        };
-        break;
-
-      case 'DEEP_OCEAN':
-        keyframePrompt = `${cleanText}. Deep aquatic atmosphere, bioluminescent glow in azure, turquoise, and deep indigo, shimmering caustic light patterns dancing across surfaces, cinematic wide composition, crystal clarity, photorealistic underwater aesthetics.`;
-        motionPrompt = `Submerged fluid forward camera drift through the scene: ${cleanText}. Shimmering caustic light refractions rippling, gentle suspended micro-particles drifting in currents, smooth weightless motion, 24fps.`;
-        cameraMotion = 'Submerged fluid forward drift with gentle weightless float';
-        visualElements = {
-          setting: 'Deep aquatic atmosphere with submerged depth',
-          surrealTwist: 'Weightless aquatic dreamscape with radiant bioluminescence',
-          lighting: 'Deep indigo environment with vibrant bioluminescent cyan caustics'
-        };
-        break;
-
-      case 'FLOATING_SKY':
-        keyframePrompt = `${cleanText}. High altitude panoramic atmosphere, expansive ethereal cloudscape, brilliant daylight, vast infinite horizon, crisp edge definition, cinematic scale, breathtaking aerial clarity.`;
-        motionPrompt = `Smooth aerial gliding camera move across the scene: ${cleanText}. Soft drifting cloud wisps, shifting radiant daylight, majestic wide camera glide, continuous smooth 24fps motion.`;
-        cameraMotion = 'High altitude aerial forward glide with wide panoramic view';
-        visualElements = {
-          setting: 'Vast ethereal cloudscape with infinite horizon',
-          surrealTwist: 'Weightless dreamlike elevation above the world',
-          lighting: 'Brilliant daylight with radiant sunbeams illuminating the scene'
-        };
-        break;
-
-      case 'GOLDEN_DREAM':
-        keyframePrompt = `${cleanText}. Golden hour cinematic masterpiece, warm amber and gilded sunlight, rich radiant rim lighting, long dramatic shadows, atmospheric warmth, crisp focal clarity, photorealistic fine art quality.`;
-        motionPrompt = `Majestic slow camera push into the scene: ${cleanText}. Shifting warm golden light rays, soft glowing particles drifting in sunbeams, smooth majestic motion, 24fps.`;
-        cameraMotion = 'Majestic slow forward dolly push into the golden light';
-        visualElements = {
-          setting: 'Luminous dream realm bathed in eternal sunset',
-          surrealTwist: 'Luminous radiant glow with golden dust reflections',
-          lighting: 'Rich golden hour rim lighting with deep amber warmth'
-        };
-        break;
-
-      case 'ETHEREAL_LUCID':
-      default:
-        keyframePrompt = `${cleanText}. Lucid dream vision, ethereal twilight illumination, soft iridescent accents, clean surreal composition, crisp subject focus, magical realism, cinematic wide shot, pristine clarity.`;
-        motionPrompt = `Smooth weightless forward camera drift through the scene: ${cleanText}. Gentle shimmering light particles, subtle environmental motion, hypnotic calm cinematic movement, 24fps.`;
-        cameraMotion = 'Slow forward tracking push with gentle weightless float';
-        visualElements = {
-          setting: 'Luminous surreal dreamscape with infinite depth',
-          surrealTwist: 'Weightless dreamlike forms and iridescent light',
-          lighting: 'Soft twilight radiance with clean atmospheric clarity'
-        };
-        break;
+    // 1. Layer 1: Regex Hard-Block (Pre-LLM)
+    const preAudit = SafetyShield.auditPrompt(cleanText);
+    if (!preAudit.passed) {
+      const err: any = new Error(preAudit.reason || 'Prompt rejected by safety filter.');
+      err.code = 'MODERATION_REJECTED';
+      err.categories = preAudit.flaggedCategories;
+      throw err;
     }
 
+    // 2. Layer 2: LLM Architect (Spatial decomposition into 1-3 scenes with structured schema)
+    console.log(`🎬 [ComfyDreamProvider] Invoking Dream Architect for narrative decomposition...`);
+    const architectResult = await this.architect.analyzeDream(cleanText, moodHint);
+
+    // 3. Layer 3: LLM Safety Assessment
+    if (!architectResult.safety?.allowed) {
+      const err: any = new Error(`Dream prompt rejected: ${architectResult.safety?.category || 'Content policy violation'}`);
+      err.code = 'MODERATION_REJECTED';
+      err.categories = [architectResult.safety?.category || 'LLM_SAFETY_VIOLATION'];
+      throw err;
+    }
+
+    if (!architectResult.scenes || architectResult.scenes.length === 0) {
+      throw new Error('Dream Architect returned 0 scenes. At least 1 valid scene is required.');
+    }
+
+    // 4. Layer 4: Post-LLM Prompt Sanitization & Moderation Audit for each scene
+    for (const scene of architectResult.scenes) {
+      const kfAudit = SafetyShield.auditPrompt(scene.keyframePrompt);
+      if (!kfAudit.passed) {
+        const err: any = new Error(`Generated scene ${scene.sceneNumber} keyframe prompt violated safety policy: ${kfAudit.reason}`);
+        err.code = 'MODERATION_REJECTED';
+        err.categories = kfAudit.flaggedCategories;
+        throw err;
+      }
+
+      const motionAudit = SafetyShield.auditPrompt(scene.motionPrompt);
+      if (!motionAudit.passed) {
+        const err: any = new Error(`Generated scene ${scene.sceneNumber} motion prompt violated safety policy: ${motionAudit.reason}`);
+        err.code = 'MODERATION_REJECTED';
+        err.categories = motionAudit.flaggedCategories;
+        throw err;
+      }
+    }
+
+    // 5. Server-side duration calculation (Duration comes strictly from server config, NOT LLM hallucination)
+    const rawSecondsPerScene = this.config.videoFrames / this.config.fps;
+    const effectiveSecondsPerScene = Math.round(rawSecondsPerScene * 2); // On-twos playback
+    const totalEstimatedSeconds = architectResult.scenes.length * effectiveSecondsPerScene;
+
+    const primaryScene = architectResult.scenes[0];
+
     return {
-      refinedPrompt: keyframePrompt,
-      keyframePrompt,
-      motionPrompt,
+      refinedPrompt: primaryScene.keyframePrompt,
+      keyframePrompt: primaryScene.keyframePrompt,
+      motionPrompt: primaryScene.motionPrompt,
       negativePrompt: SafetyShield.getNegativePrompt(),
-      cameraMotion,
-      detectedMood,
-      visualElements
+      cameraMotion: primaryScene.cameraMotion,
+      detectedMood: primaryScene.mood,
+      scenes: architectResult.scenes,
+      totalEstimatedSeconds,
+      visualElements: {
+        setting: primaryScene.summary,
+        surrealTwist: `${architectResult.scenes.length} scene(s) structured by Dream Architect`,
+        lighting: `${primaryScene.mood} cinematic illumination`
+      }
     };
   }
 
