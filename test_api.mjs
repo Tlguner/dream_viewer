@@ -98,6 +98,12 @@ async function runApiVerification() {
   const dreamId = dreamData.dreamId;
   console.log(`  ✓ Passed: Session created with dreamId=${dreamId}`);
 
+  // 4b: SSE Live Progress Endpoint verification
+  const progressRes = await fetch(`${BASE_URL}/dreams/progress/${dreamId}`);
+  assert.strictEqual(progressRes.status, 200, 'SSE endpoint must return 200 OK');
+  assert(progressRes.headers.get('content-type')?.includes('text/event-stream'), 'Must serve text/event-stream');
+  console.log('  ✓ Passed: SSE Live Progress endpoint returns 200 with text/event-stream header');
+
   // 5. Keyframes Generation with Server-Locked Session
   console.log('\nTest 5: Keyframe generation requiring valid dreamId & verifying mock status');
   

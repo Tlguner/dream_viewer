@@ -7,7 +7,9 @@ import {
   DreamPromptAnalysis, 
   KeyframeOption, 
   DreamVideoResult, 
-  MoodStyle 
+  MoodStyle,
+  DreamProgressEvent,
+  ProgressCallback
 } from '../types/index.js';
 import { SafetyShield } from '../moderation/shield.js';
 
@@ -18,6 +20,45 @@ export class ComfyDreamProvider implements IDreamProvider {
   private serverBaseUrl: string;
   private storageVideosDir: string;
   private storageKeyframesDir: string;
+  private clientId: string = 'dream_viewer_' + crypto.randomUUID().substring(0, 8);
+  private ws: any = null;
+  private wsListeners: Set<(msg: any) => void> = new Set();
+
+  private ensureWebSocket(): void {
+    if (this.ws && (this.ws.readyState === 1 || this.ws.readyState === 0)) {
+      return;
+    }
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+
+    try {
+      const wsUrl = `${this.comfyHost.replace(/^http/, 'ws')}/ws?clientId=${this.clientId}`;
+      this.ws = new (globalThis as any).WebSocket(wsUrl);
+
+      this.ws.onmessage = (event: any) => {
+        try {
+          const parsed = JSON.parse(event.data.toString());
+          for (const listener of this.wsListeners) {
+            listener(parsed);
+          }
+        } catch {
+          // ignore non-json messages
+        }
+      };
+
+      this.ws.onerror = (_e: any) => {
+        // softly handled
+      };
+
+      this.ws.onclose = () => {
+        this.ws = null;
+      };
+    } catch (err: any) {
+      console.warn('[ComfyDreamProvider] WebSocket initialization notice:', err.message);
+    }
+  }
 
   // Dynamically load Wan 2.2 parameters so .env edits apply immediately without server restart
   private get config() {
@@ -199,7 +240,11 @@ export class ComfyDreamProvider implements IDreamProvider {
    * In Comfy mode, this does NOT fall back to Unsplash stock photos.
    * Generates `count` distinct seeds in a single cached ComfyUI execution graph.
    */
-  public async generateKeyframes(keyframePrompt: string, count: number = 3): Promise<KeyframeOption[]> {
+  public async generateKeyframes(
+    keyframePrompt: string, 
+    count: number = 3,
+    onProgress?: ProgressCallback
+  ): Promise<KeyframeOption[]> {
     console.log(`🎨 [ComfyDreamProvider] Generating ${count} genuine GPU keyframes via Wan 2.2...`);
 
     const baseSeed = Math.floor(Math.random() * 8000000000000000);
@@ -313,10 +358,12 @@ export class ComfyDreamProvider implements IDreamProvider {
       };
     }
 
+    this.ensureWebSocket();
+
     const queueRes = await fetch(`${this.comfyHost}/prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: kfPrompt })
+      body: JSON.stringify({ prompt: kfPrompt, client_id: this.clientId })
     });
 
     if (!queueRes.ok) {
@@ -332,6 +379,60 @@ export class ComfyDreamProvider implements IDreamProvider {
     const startTime = Date.now();
     const timeoutMs = 90_000;
     let completedItem: any = null;
+
+    const kfProgressListener = (msg: any) => {
+      try {
+        if (!msg || !msg.type || !msg.data) return;
+        const data = msg.data;
+        if (data.prompt_id && data.prompt_id !== promptId) return;
+
+        const elapsedSec = Math.max(0, (Date.now() - startTime) / 1000);
+
+        if (msg.type === 'execution_start') {
+          onProgress?.({
+            stage: 'INITIALIZING',
+            stageLabel: 'Composition Engine',
+            detail: `Synthesizing ${count} artistic anchors on RTX GPU...`,
+            percent: 5,
+            elapsedSeconds: Math.round(elapsedSec),
+            etaSeconds: 18
+          });
+        } else if (msg.type === 'progress') {
+          const val = Number(data.value || 0);
+          const max = Number(data.max || 10);
+          const ratio = Math.min(1, Math.max(0, val / max));
+
+          let basePercent = 8;
+          let currentKfIndex = 1;
+          if (data.node === 'ksampler_kf_2') {
+            basePercent = 38;
+            currentKfIndex = 2;
+          } else if (data.node === 'ksampler_kf_3') {
+            basePercent = 68;
+            currentKfIndex = 3;
+          }
+
+          const percent = Math.min(95, Math.round(basePercent + (ratio * 28)));
+          const remainingSec = Math.max(2, Math.round((count - currentKfIndex + 1 - ratio) * 6));
+
+          onProgress?.({
+            stage: 'DIFFUSION',
+            stageLabel: 'Synthesizing Keyframes',
+            detail: `Rendering Keyframe ${currentKfIndex}/${count} (Step ${val}/${max})`,
+            percent,
+            step: val,
+            totalSteps: max,
+            elapsedSeconds: Math.round(elapsedSec),
+            etaSeconds: remainingSec,
+            nodeType: 'KSampler'
+          });
+        }
+      } catch (err: any) {
+        console.warn('Keyframe progress listener error:', err.message);
+      }
+    };
+
+    this.wsListeners.add(kfProgressListener);
 
     try {
       while (Date.now() - startTime < timeoutMs) {
@@ -370,6 +471,8 @@ export class ComfyDreamProvider implements IDreamProvider {
         await this.cancelComfyJob(promptId);
       }
       throw pollErr;
+    } finally {
+      this.wsListeners.delete(kfProgressListener);
     }
 
     // Process and persist all generated keyframe images into server storage
@@ -460,7 +563,8 @@ export class ComfyDreamProvider implements IDreamProvider {
   public async generateVideo(
     selectedKeyframe: KeyframeOption,
     motionPrompt: string,
-    cameraMotion: string
+    cameraMotion: string,
+    onProgress?: ProgressCallback
   ): Promise<DreamVideoResult> {
     console.log(`📡 [ComfyDreamProvider] Starting Image-to-Video generation on ComfyUI at ${this.comfyHost}...`);
 
@@ -591,11 +695,13 @@ export class ComfyDreamProvider implements IDreamProvider {
       }
     };
 
+    this.ensureWebSocket();
+
     // 4. Send workflow to ComfyUI /prompt
     const queueResponse = await fetch(`${this.comfyHost}/prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: workflowPrompt })
+      body: JSON.stringify({ prompt: workflowPrompt, client_id: this.clientId })
     });
 
     if (!queueResponse.ok) {
@@ -611,6 +717,93 @@ export class ComfyDreamProvider implements IDreamProvider {
     const startTime = Date.now();
     const timeoutMs = 300_000;
     let completedHistory: any = null;
+
+    const progressListener = (msg: any) => {
+      try {
+        if (!msg || !msg.type || !msg.data) return;
+        const data = msg.data;
+        if (data.prompt_id && data.prompt_id !== promptId) return;
+
+        const elapsedSec = Math.max(0, (Date.now() - startTime) / 1000);
+
+        if (msg.type === 'execution_start') {
+          onProgress?.({
+            stage: 'INITIALIZING',
+            stageLabel: 'Preparing GPU Latents',
+            detail: 'Allocating VRAM and initializing Wan 2.2 model...',
+            percent: 5,
+            elapsedSeconds: Math.round(elapsedSec),
+            etaSeconds: Math.round(videoFrames * 1.6)
+          });
+        } else if (msg.type === 'executing') {
+          const node = data.node;
+          if (node === '56') {
+            onProgress?.({
+              stage: 'INITIALIZING',
+              stageLabel: 'Keyframe Ingestion',
+              detail: 'Uploading keyframe image to GPU latent buffer...',
+              percent: 10,
+              elapsedSeconds: Math.round(elapsedSec)
+            });
+          } else if (node === '3') {
+            onProgress?.({
+              stage: 'DIFFUSION',
+              stageLabel: 'Wan 2.2 Neural Diffusion',
+              detail: `Starting ${steps} denoising sampling steps...`,
+              percent: 15,
+              step: 0,
+              totalSteps: steps,
+              elapsedSeconds: Math.round(elapsedSec),
+              nodeType: 'KSampler'
+            });
+          } else if (node === '8') {
+            onProgress?.({
+              stage: 'DECODING',
+              stageLabel: 'Neural VAE Decoding',
+              detail: `Decoding ${videoFrames} latent frames into RGB pixels...`,
+              percent: 88,
+              elapsedSeconds: Math.round(elapsedSec),
+              etaSeconds: 6,
+              nodeType: 'VAEDecode'
+            });
+          } else if (node === '57' || node === '58') {
+            onProgress?.({
+              stage: 'SAVING',
+              stageLabel: 'Compiling MP4 Video',
+              detail: 'Encoding video stream and writing to server storage...',
+              percent: 96,
+              elapsedSeconds: Math.round(elapsedSec),
+              etaSeconds: 2,
+              nodeType: 'SaveVideo'
+            });
+          }
+        } else if (msg.type === 'progress') {
+          const val = Number(data.value || 0);
+          const max = Number(data.max || steps || 1);
+          const ratio = Math.min(1, Math.max(0, val / max));
+          const percent = Math.min(85, Math.round(15 + (ratio * 70)));
+          const secPerStep = val > 0 ? elapsedSec / val : 3.2;
+          const remainingSteps = Math.max(0, max - val);
+          const etaSeconds = Math.max(4, Math.round(remainingSteps * secPerStep + 8));
+
+          onProgress?.({
+            stage: 'DIFFUSION',
+            stageLabel: 'Wan 2.2 Neural Diffusion',
+            detail: `Sampling step ${val}/${max} (${Math.round(ratio * 100)}%)`,
+            percent,
+            step: val,
+            totalSteps: max,
+            elapsedSeconds: Math.round(elapsedSec),
+            etaSeconds,
+            nodeType: 'KSampler'
+          });
+        }
+      } catch (err: any) {
+        console.warn('Progress listener error:', err.message);
+      }
+    };
+
+    this.wsListeners.add(progressListener);
 
     try {
       while (Date.now() - startTime < timeoutMs) {
@@ -652,6 +845,8 @@ export class ComfyDreamProvider implements IDreamProvider {
         await this.cancelComfyJob(promptId);
       }
       throw pollErr;
+    } finally {
+      this.wsListeners.delete(progressListener);
     }
 
     // 6. Find output video file from history
@@ -699,6 +894,15 @@ export class ComfyDreamProvider implements IDreamProvider {
     const serverMediaUrl = `${this.serverBaseUrl}/api/media/videos/${localVideoFilename}`;
     const nativeDuration = Number((videoFrames / fps).toFixed(1));
     const effectiveDuration = Number((nativeDuration * 2).toFixed(1));
+
+    onProgress?.({
+      stage: 'COMPLETED',
+      stageLabel: 'Dream Manifested!',
+      detail: 'Video stream ready for playback',
+      percent: 100,
+      elapsedSeconds: Math.round((Date.now() - startTime) / 1000),
+      etaSeconds: 0
+    });
 
     console.log(`🎬 [ComfyDreamProvider] Serving video from: ${serverMediaUrl}`);
 

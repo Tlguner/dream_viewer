@@ -3,6 +3,7 @@ import { Navbar } from './components/Navbar';
 import { DreamInputStep } from './components/DreamInputStep';
 import { KeyframeReviewStep } from './components/KeyframeReviewStep';
 import { DreamPlayerStep } from './components/DreamPlayerStep';
+import { ManifestingHUD, type LiveProgress } from './components/ManifestingHUD';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000/api';
 
@@ -15,6 +16,11 @@ export function App() {
   const [isLoadingVideo, setIsLoadingVideo] = useState(false);
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Live real-time progress HUD state
+  const [liveProgress, setLiveProgress] = useState<LiveProgress | null>(null);
+  const [hudMode, setHudMode] = useState<'KEYFRAMES' | 'VIDEO'>('VIDEO');
+  const [isHudOpen, setIsHudOpen] = useState<boolean>(false);
 
   // Initial provider info starts in honest mock/detecting state so it never falsely flashes GPU
   const [providerInfo, setProviderInfo] = useState<{ name: string; isMock: boolean }>({
@@ -53,6 +59,36 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  // Helper to open live SSE progress stream
+  const subscribeToProgress = (dreamId: string, mode: 'KEYFRAMES' | 'VIDEO') => {
+    setHudMode(mode);
+    setLiveProgress({
+      stage: 'INITIALIZING',
+      stageLabel: mode === 'VIDEO' ? 'Preparing Video Pipeline' : 'Initializing Keyframe Pipeline',
+      detail: 'Connecting to GPU live stream...',
+      percent: 0,
+      elapsedSeconds: 0
+    });
+    setIsHudOpen(true);
+
+    const eventSource = new EventSource(`${API_BASE}/dreams/progress/${dreamId}`);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setLiveProgress(data);
+      } catch {
+        // ignore non-json
+      }
+    };
+
+    eventSource.onerror = () => {
+      // Keep EventSource alive or fallback gracefully
+    };
+
+    return eventSource;
+  };
+
   // Step 1: Analyze Dream with Dream Architect & Moderation Shield
   const handleAnalyze = async (rawText: string, moodHint: string) => {
     setIsAnalyzing(true);
@@ -75,19 +111,25 @@ export function App() {
       setCurrentDreamId(dreamId);
       setAnalysisData(data.data);
 
-      // Step 2: Trigger Keyframe generation using server-locked dreamId
-      const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dreamId, count: 3 })
-      });
+      // Step 2: Trigger Keyframe generation with live SSE progress stream
+      const sse = subscribeToProgress(dreamId, 'KEYFRAMES');
+      try {
+        const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dreamId, count: 3 })
+        });
 
-      const kfData = await kfRes.json();
-      if (!kfRes.ok) throw new Error(kfData.message || 'Failed to generate keyframes');
+        const kfData = await kfRes.json();
+        if (!kfRes.ok) throw new Error(kfData.message || 'Failed to generate keyframes');
 
-      setKeyframes(kfData.keyframes);
-      setSelectedKeyframe(kfData.keyframes[0]);
-      setStep('KEYFRAMES');
+        setKeyframes(kfData.keyframes);
+        setSelectedKeyframe(kfData.keyframes[0]);
+        setStep('KEYFRAMES');
+      } finally {
+        sse.close();
+        setIsHudOpen(false);
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'An unexpected issue occurred while analyzing your dream.');
@@ -96,11 +138,12 @@ export function App() {
     }
   };
 
-  // Regenerate keyframes using server-side session
+  // Regenerate keyframes using server-side session with live progress
   const handleRegenerateKeyframes = async () => {
     if (!currentDreamId) return;
     setIsRegenerating(true);
 
+    const sse = subscribeToProgress(currentDreamId, 'KEYFRAMES');
     try {
       const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
         method: 'POST',
@@ -116,14 +159,18 @@ export function App() {
     } catch (err) {
       console.error(err);
     } finally {
+      sse.close();
+      setIsHudOpen(false);
       setIsRegenerating(false);
     }
   };
 
-  // Step 3: Animate Approved Keyframe into Video via server-locked IDs
+  // Step 3: Animate Approved Keyframe into Video via server-locked IDs with live SSE progress
   const handleAnimate = async (keyframe: any) => {
     if (!currentDreamId) return;
     setIsLoadingVideo(true);
+
+    const sse = subscribeToProgress(currentDreamId, 'VIDEO');
     try {
       const res = await fetch(`${API_BASE}/dreams/generate-video`, {
         method: 'POST',
@@ -152,6 +199,8 @@ export function App() {
       console.error(err);
       setError(err.message || 'Failed to generate dream video.');
     } finally {
+      sse.close();
+      setIsHudOpen(false);
       setIsLoadingVideo(false);
     }
   };
@@ -165,6 +214,7 @@ export function App() {
     setSelectedKeyframe(null);
     setCompletedDream(null);
     setError(null);
+    setIsHudOpen(false);
   };
 
   return (
@@ -203,6 +253,14 @@ export function App() {
           />
         )}
       </main>
+
+      {/* Live Real-Time GPU Progress HUD */}
+      <ManifestingHUD
+        isOpen={isHudOpen}
+        mode={hudMode}
+        progress={liveProgress}
+        providerName={providerInfo.name}
+      />
 
       {/* Global Ethereal Footer */}
       <footer className="w-full glass-panel border-t border-dream-border py-6 px-4 text-center text-xs text-slate-400">

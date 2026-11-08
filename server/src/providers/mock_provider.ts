@@ -6,7 +6,9 @@ import {
   DreamPromptAnalysis, 
   KeyframeOption, 
   DreamVideoResult, 
-  MoodStyle 
+  MoodStyle,
+  DreamProgressEvent,
+  ProgressCallback
 } from '../types/index.js';
 import { SafetyShield } from '../moderation/shield.js';
 
@@ -172,8 +174,30 @@ export class MockDreamProvider implements IDreamProvider {
   /**
    * Return self-hosted mock keyframes without touching external APIs or CDN
    */
-  public async generateKeyframes(_keyframePrompt: string, count: number = 3): Promise<KeyframeOption[]> {
-    await new Promise(r => setTimeout(r, 100));
+  public async generateKeyframes(
+    _keyframePrompt: string, 
+    count: number = 3,
+    onProgress?: ProgressCallback
+  ): Promise<KeyframeOption[]> {
+    onProgress?.({
+      stage: 'INITIALIZING',
+      stageLabel: 'Composition Engine',
+      detail: `Synthesizing ${count} artistic anchors...`,
+      percent: 25,
+      elapsedSeconds: 0
+    });
+
+    await new Promise(r => setTimeout(r, 60));
+
+    onProgress?.({
+      stage: 'DIFFUSION',
+      stageLabel: 'Rendering Keyframes',
+      detail: 'Processing compositions...',
+      percent: 75,
+      elapsedSeconds: 0
+    });
+
+    await new Promise(r => setTimeout(r, 60));
 
     this.ensureFixturesInStorage();
 
@@ -192,6 +216,14 @@ export class MockDreamProvider implements IDreamProvider {
       });
     }
 
+    onProgress?.({
+      stage: 'COMPLETED',
+      stageLabel: 'Keyframes Ready',
+      detail: `${keyframes.length} anchors loaded`,
+      percent: 100,
+      elapsedSeconds: 0
+    });
+
     return keyframes;
   }
 
@@ -201,9 +233,43 @@ export class MockDreamProvider implements IDreamProvider {
   public async generateVideo(
     _selectedKeyframe: KeyframeOption, 
     _motionPrompt: string, 
-    _cameraMotion: string
+    _cameraMotion: string,
+    onProgress?: ProgressCallback
   ): Promise<DreamVideoResult> {
-    await new Promise(r => setTimeout(r, 300));
+    onProgress?.({
+      stage: 'INITIALIZING',
+      stageLabel: 'Initializing Video Pipeline',
+      detail: 'Ingesting keyframe image...',
+      percent: 15,
+      elapsedSeconds: 0,
+      etaSeconds: 2
+    });
+
+    await new Promise(r => setTimeout(r, 80));
+
+    onProgress?.({
+      stage: 'DIFFUSION',
+      stageLabel: 'Neural Video Diffusion',
+      detail: 'Sampling motion vectors (Step 8/15)...',
+      percent: 55,
+      step: 8,
+      totalSteps: 15,
+      elapsedSeconds: 0,
+      etaSeconds: 1
+    });
+
+    await new Promise(r => setTimeout(r, 80));
+
+    onProgress?.({
+      stage: 'DECODING',
+      stageLabel: 'VAE Decoding',
+      detail: 'Synthesizing output frames...',
+      percent: 88,
+      elapsedSeconds: 0,
+      etaSeconds: 0
+    });
+
+    await new Promise(r => setTimeout(r, 80));
 
     this.ensureFixturesInStorage();
 
@@ -218,6 +284,15 @@ export class MockDreamProvider implements IDreamProvider {
     }
 
     const videoUrl = `${this.serverBaseUrl}/api/media/videos/${filename}`;
+
+    onProgress?.({
+      stage: 'COMPLETED',
+      stageLabel: 'Dream Manifested!',
+      detail: 'Mock video ready for playback',
+      percent: 100,
+      elapsedSeconds: 0,
+      etaSeconds: 0
+    });
 
     return {
       id: videoId,

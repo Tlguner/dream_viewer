@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { SafetyShield } from './moderation/shield.js';
 import { MockDreamProvider } from './providers/mock_provider.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
-import { MoodStyle, IDreamProvider, DreamSession } from './types/index.js';
+import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent } from './types/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -82,6 +82,25 @@ const demoUser = {
 
 // Stateful dream sessions: Prevents moderation bypass, prompt injection, and SSRF
 const dreamSessions = new Map<string, DreamSession>();
+
+// Active live progress subscriptions per dreamId
+const progressEvents = new Map<string, DreamProgressEvent>();
+const progressClients = new Map<string, Set<express.Response>>();
+
+function emitDreamProgress(dreamId: string, event: DreamProgressEvent) {
+  progressEvents.set(dreamId, event);
+  const clients = progressClients.get(dreamId);
+  if (clients && clients.size > 0) {
+    const payload = `data: ${JSON.stringify(event)}\n\n`;
+    for (const client of clients) {
+      try {
+        client.write(payload);
+      } catch {
+        clients.delete(client);
+      }
+    }
+  }
+}
 
 // Concurrency guard: Only 1 active generation allowed on single local GPU (videos & keyframes)
 let isGpuBusy = false;
@@ -161,6 +180,55 @@ app.get('/api/health', (req, res) => {
     isMock: dreamProvider.isMock,
     isGpuBusy,
     environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// SSE Progress Endpoint: Stream live real-time generation progress to frontend
+app.get('/api/dreams/progress/:dreamId', (req, res) => {
+  const { dreamId } = req.params;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders?.();
+
+  // Send latest cached event or default starting state immediately
+  const latest = progressEvents.get(dreamId);
+  if (latest) {
+    res.write(`data: ${JSON.stringify(latest)}\n\n`);
+  } else {
+    res.write(`data: ${JSON.stringify({
+      stage: 'INITIALIZING',
+      stageLabel: 'Connecting to GPU Pipeline',
+      detail: 'Awaiting execution queue...',
+      percent: 0,
+      elapsedSeconds: 0
+    })}\n\n`);
+  }
+
+  if (!progressClients.has(dreamId)) {
+    progressClients.set(dreamId, new Set());
+  }
+  progressClients.get(dreamId)!.add(res);
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': keepalive\n\n');
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const clients = progressClients.get(dreamId);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) {
+        progressClients.delete(dreamId);
+      }
+    }
   });
 });
 
@@ -286,8 +354,12 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       // Refresh TTL
       session.expiresAt = Date.now() + SESSION_TTL_MS;
 
-      // Generate keyframes using server-locked scene prompt
-      const keyframes = await dreamProvider.generateKeyframes(session.keyframePrompt || session.refinedPrompt, count);
+      // Generate keyframes using server-locked scene prompt with live progress
+      const keyframes = await dreamProvider.generateKeyframes(
+        session.keyframePrompt || session.refinedPrompt, 
+        count,
+        (prog) => emitDreamProgress(dreamId, prog)
+      );
       session.keyframes = keyframes;
       session.status = 'keyframes_ready';
 
@@ -366,7 +438,8 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     const video = await dreamProvider.generateVideo(
       approvedKeyframe,
       session.motionPrompt || session.refinedPrompt,
-      session.cameraMotion
+      session.cameraMotion,
+      (prog) => emitDreamProgress(session.dreamId, prog)
     );
 
     // Deduct credit ONLY upon verified success

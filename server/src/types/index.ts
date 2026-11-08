@@ -66,10 +66,24 @@ export interface DreamSession {
   expiresAt: number;
 }
 
+export interface DreamProgressEvent {
+  stage: 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
+  stageLabel: string;
+  detail: string;
+  percent: number;           // 0 to 100
+  step?: number;
+  totalSteps?: number;
+  elapsedSeconds: number;
+  etaSeconds?: number;
+  nodeType?: string;
+}
+
+export type ProgressCallback = (progress: DreamProgressEvent) => void;
+
 export interface IDreamProvider {
   name: string;
   isMock: boolean;
   analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis>;
-  generateKeyframes(keyframePrompt: string, count?: number): Promise<KeyframeOption[]>;
-  generateVideo(selectedKeyframe: KeyframeOption, motionPrompt: string, cameraMotion: string): Promise<DreamVideoResult>;
+  generateKeyframes(keyframePrompt: string, count?: number, onProgress?: ProgressCallback): Promise<KeyframeOption[]>;
+  generateVideo(selectedKeyframe: KeyframeOption, motionPrompt: string, cameraMotion: string, onProgress?: ProgressCallback): Promise<DreamVideoResult>;
 }
