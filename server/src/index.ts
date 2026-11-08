@@ -105,13 +105,21 @@ function emitDreamProgress(dreamId: string, event: DreamProgressEvent) {
 // Concurrency guard: Only 1 active generation allowed on single local GPU (videos & keyframes)
 let isGpuBusy = false;
 
-// Evict expired sessions periodically (1-hour TTL)
+// Evict expired sessions periodically (1-hour TTL) and clean up progress maps
 const SESSION_TTL_MS = 60 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of dreamSessions.entries()) {
     if (session.expiresAt && session.expiresAt < now) {
       dreamSessions.delete(id);
+      progressEvents.delete(id);
+      const clients = progressClients.get(id);
+      if (clients) {
+        for (const client of clients) {
+          try { client.end(); } catch {}
+        }
+        progressClients.delete(id);
+      }
     }
   }
 }, 10 * 60 * 1000).unref();
@@ -186,6 +194,14 @@ app.get('/api/health', (req, res) => {
 // SSE Progress Endpoint: Stream live real-time generation progress to frontend
 app.get('/api/dreams/progress/:dreamId', (req, res) => {
   const { dreamId } = req.params;
+
+  const session = dreamSessions.get(dreamId);
+  if (!session) {
+    return res.status(404).json({
+      error: 'SESSION_NOT_FOUND',
+      message: 'Dream session expired or invalid.'
+    });
+  }
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -459,6 +475,18 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     session.expiresAt = Date.now() + SESSION_TTL_MS;
     recentDreams.unshift(completedDream);
 
+    // Gracefully clean up SSE stream and cached progress event after client receives completion
+    setTimeout(() => {
+      progressEvents.delete(session.dreamId);
+      const clients = progressClients.get(session.dreamId);
+      if (clients) {
+        for (const client of clients) {
+          try { client.end(); } catch {}
+        }
+        progressClients.delete(session.dreamId);
+      }
+    }, 15_000).unref();
+
     res.json({
       success: true,
       remainingCredits: demoUser.credits,
@@ -468,6 +496,19 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     console.error('Error generating video:', error);
     session.status = 'failed';
     // User credits were NOT deducted
+
+    // Clean up SSE stream on failure
+    setTimeout(() => {
+      progressEvents.delete(session.dreamId);
+      const clients = progressClients.get(session.dreamId);
+      if (clients) {
+        for (const client of clients) {
+          try { client.end(); } catch {}
+        }
+        progressClients.delete(session.dreamId);
+      }
+    }, 15_000).unref();
+
     res.status(500).json({ error: 'FAILED_TO_GENERATE_VIDEO', message: error.message });
   } finally {
     // Release GPU lock unconditionally

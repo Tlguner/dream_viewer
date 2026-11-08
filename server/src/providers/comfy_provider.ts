@@ -60,22 +60,25 @@ export class ComfyDreamProvider implements IDreamProvider {
     }
   }
 
-  // Dynamically load Wan 2.2 parameters so .env edits apply immediately without server restart
+  // Dynamically load Wan 2.2 parameters so .env edits apply immediately in development without server restart
   private get config() {
-    try {
-      const rootEnv = path.resolve(this.storageVideosDir, '..', '..', '.env');
-      if (fs.existsSync(rootEnv)) {
-        dotenv.config({ path: rootEnv, override: true });
+    if (process.env.NODE_ENV !== 'production') {
+      try {
+        const rootEnv = path.resolve(this.storageVideosDir, '..', '..', '.env');
+        if (fs.existsSync(rootEnv)) {
+          dotenv.config({ path: rootEnv, override: true });
+        }
+      } catch {
+        // fallback to existing process.env
       }
-    } catch {
-      // fallback to existing process.env
     }
 
     return {
       videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
+      videoTimeoutMs: parseInt(process.env.WAN_VIDEO_TIMEOUT_MS || '900000', 10),
       easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
       steps: parseInt(process.env.WAN_STEPS || '15', 10),
-      keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '10', 10),
+      keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '20', 10),
       width: parseInt(process.env.WAN_WIDTH || '832', 10),
       height: parseInt(process.env.WAN_HEIGHT || '480', 10),
       fps: parseInt(process.env.WAN_FPS || '24', 10),
@@ -122,68 +125,68 @@ export class ComfyDreamProvider implements IDreamProvider {
 
     switch (detectedMood) {
       case 'SURREAL_CYBERPUNK':
-        keyframePrompt = `Wide aerial establishing shot of a futuristic cyberpunk megacity at night: ${cleanText}. Dozens of towering dark skyscrapers stretching to the horizon, giant neon billboards on facades in vibrant cyan and magenta, small flying cars with glowing headlights between towers, clean wet reflective surfaces, sharp architectural geometry, photorealistic sharp detail.`;
-        motionPrompt = 'Slow steady forward drone flight over the futuristic city. Flying vehicles glide slowly through the frame between skyscrapers, neon signs softly flicker, light rain drifts smoothly. Continuous 24fps motion.';
-        cameraMotion = 'Slow forward aerial drone glide between skyscrapers';
+        keyframePrompt = `${cleanText}. Cyberpunk aesthetic, intense high-contrast cinematic lighting, vibrant neon color grading with electric cyan, ultraviolet, and hot magenta accents, sharp geometric clarity, polished wet surfaces with clean glossy reflections, deep atmospheric shadows, photorealistic cinematic detail.`;
+        motionPrompt = `Smooth fluid tracking camera push through the scene: ${cleanText}. Ambient neon illumination subtly pulsing, soft shimmering wet reflections, atmospheric light bloom, continuous smooth 24fps cinematic motion.`;
+        cameraMotion = 'Smooth forward tracking push with dynamic low-angle glide';
         visualElements = {
-          setting: 'Dense vertical megacity with towering brutalist skyscrapers and skybridges',
-          surrealTwist: 'Holographic neon advertisements and airborne transit lanes',
-          lighting: 'High-contrast cyan and magenta neon illumination with clean wet reflections'
+          setting: 'Cyberpunk dreamscape with intense atmospheric depth',
+          surrealTwist: 'High-contrast luminescence and glossy wet surface reflections',
+          lighting: 'Vibrant neon color grading with cyan, ultraviolet, and magenta rim glow'
         };
         break;
 
       case 'NOSTALGIC_FOG':
-        keyframePrompt = `Vintage 35mm film still: ${cleanText}. Muted color palette, nostalgic atmospheric dreamscape, soft rim light, clean focal composition, fine film grain, evocative cinema aesthetic.`;
-        motionPrompt = 'Slow contemplative camera push forward. Soft atmospheric dust motes gently drifting, subtle ambient light shifting, smooth calm motion.';
+        keyframePrompt = `${cleanText}. Vintage 35mm film still, nostalgic cinema aesthetic, muted pastel color palette, soft gentle rim lighting, clean focal composition, delicate natural film grain, evocative dreamlike atmosphere, photorealistic depth.`;
+        motionPrompt = `Slow contemplative camera push through the scene: ${cleanText}. Soft atmospheric dust motes gently drifting, subtle ambient light shifting, calm serene motion, 24fps.`;
         cameraMotion = 'Slow contemplative dolly tracking push';
         visualElements = {
-          setting: 'Misty nostalgic landscape with vintage timeless architecture',
+          setting: 'Atmospheric dreamscape with nostalgic depth',
           surrealTwist: 'Dreamlike memories suspended in soft atmospheric light',
           lighting: 'Muted warm dawn glow with soft cinematic shadows'
         };
         break;
 
       case 'DEEP_OCEAN':
-        keyframePrompt = `Deep oceanic abyss: ${cleanText}. Underwater bioluminescent glow in azure and deep indigo, floating aquatic structures, shimmering caustic light patterns dancing across surfaces, cinematic wide angle, sharp detail.`;
-        motionPrompt = 'Submerged underwater slow forward drift. Floating bioluminescent plankton swirling gently, flowing fluid currents, smooth underwater camera motion.';
-        cameraMotion = 'Submerged fluid forward drift with gentle vertical sway';
+        keyframePrompt = `${cleanText}. Deep aquatic atmosphere, bioluminescent glow in azure, turquoise, and deep indigo, shimmering caustic light patterns dancing across surfaces, cinematic wide composition, crystal clarity, photorealistic underwater aesthetics.`;
+        motionPrompt = `Submerged fluid forward camera drift through the scene: ${cleanText}. Shimmering caustic light refractions rippling, gentle suspended micro-particles drifting in currents, smooth weightless motion, 24fps.`;
+        cameraMotion = 'Submerged fluid forward drift with gentle weightless float';
         visualElements = {
-          setting: 'Submerged oceanic abyss with colossal bioluminescent architecture',
-          surrealTwist: 'Weightless aquatic dreamscape with floating luminescent elements',
-          lighting: 'Deep indigo water with vibrant bioluminescent cyan caustics'
+          setting: 'Deep aquatic atmosphere with submerged depth',
+          surrealTwist: 'Weightless aquatic dreamscape with radiant bioluminescence',
+          lighting: 'Deep indigo environment with vibrant bioluminescent cyan caustics'
         };
         break;
 
       case 'FLOATING_SKY':
-        keyframePrompt = `High altitude panoramic view: ${cleanText}. Floating architectural monoliths above expansive golden clouds, brilliant daylight, vast infinite horizon, crisp architectural edges, cinematic scale.`;
-        motionPrompt = 'Smooth aerial gliding flight above the cloud deck. Slow floating motion of architectural structures, drifting clouds, majestic wide camera glide.';
+        keyframePrompt = `${cleanText}. High altitude panoramic atmosphere, expansive ethereal cloudscape, brilliant daylight, vast infinite horizon, crisp edge definition, cinematic scale, breathtaking aerial clarity.`;
+        motionPrompt = `Smooth aerial gliding camera move across the scene: ${cleanText}. Soft drifting cloud wisps, shifting radiant daylight, majestic wide camera glide, continuous smooth 24fps motion.`;
         cameraMotion = 'High altitude aerial forward glide with wide panoramic view';
         visualElements = {
-          setting: 'Vast cloudscape horizon with colossal floating structures',
-          surrealTwist: 'Gravity-defying architecture floating effortlessly above the clouds',
-          lighting: 'Brilliant golden daylight casting sharp sunbeams across clouds'
+          setting: 'Vast ethereal cloudscape with infinite horizon',
+          surrealTwist: 'Weightless dreamlike elevation above the world',
+          lighting: 'Brilliant daylight with radiant sunbeams illuminating the scene'
         };
         break;
 
       case 'GOLDEN_DREAM':
-        keyframePrompt = `Golden hour cinematic masterpiece: ${cleanText}. Warm amber and gilded sunlight, rich rim lighting, long dramatic shadows, atmospheric warmth, crisp focal elements, photorealistic quality.`;
-        motionPrompt = 'Slow golden hour camera push. Shifting golden light rays, soft floating dust particles in sunbeams, smooth majestic motion.';
+        keyframePrompt = `${cleanText}. Golden hour cinematic masterpiece, warm amber and gilded sunlight, rich radiant rim lighting, long dramatic shadows, atmospheric warmth, crisp focal clarity, photorealistic fine art quality.`;
+        motionPrompt = `Majestic slow camera push into the scene: ${cleanText}. Shifting warm golden light rays, soft glowing particles drifting in sunbeams, smooth majestic motion, 24fps.`;
         cameraMotion = 'Majestic slow forward dolly push into the golden light';
         visualElements = {
           setting: 'Luminous dream realm bathed in eternal sunset',
-          surrealTwist: 'Gilded surreal structures radiating warm amber light',
+          surrealTwist: 'Luminous radiant glow with golden dust reflections',
           lighting: 'Rich golden hour rim lighting with deep amber warmth'
         };
         break;
 
       case 'ETHEREAL_LUCID':
       default:
-        keyframePrompt = `Lucid dream vision: ${cleanText}. Ethereal twilight illumination, clean surreal architectural composition, iridescent accents, crisp subject focus, magical realism, cinematic wide shot.`;
-        motionPrompt = 'Smooth weightless forward drift. Gentle shimmering light particles, subtle environmental motion, hypnotic calm cinematic movement.';
+        keyframePrompt = `${cleanText}. Lucid dream vision, ethereal twilight illumination, soft iridescent accents, clean surreal composition, crisp subject focus, magical realism, cinematic wide shot, pristine clarity.`;
+        motionPrompt = `Smooth weightless forward camera drift through the scene: ${cleanText}. Gentle shimmering light particles, subtle environmental motion, hypnotic calm cinematic movement, 24fps.`;
         cameraMotion = 'Slow forward tracking push with gentle weightless float';
         visualElements = {
-          setting: 'Luminous surreal horizon with dream architecture',
-          surrealTwist: 'Weightless gravity-defying forms and iridescent light',
+          setting: 'Luminous surreal dreamscape with infinite depth',
+          surrealTwist: 'Weightless dreamlike forms and iridescent light',
           lighting: 'Soft twilight radiance with clean atmospheric clarity'
         };
         break;
@@ -256,21 +259,11 @@ export class ComfyDreamProvider implements IDreamProvider {
           "weight_dtype": "default"
         }
       },
-      "60": {
-        "class_type": "EasyCache",
-        "inputs": {
-          "reuse_threshold": this.config.easyCacheThreshold,
-          "start_percent": 0.15,
-          "end_percent": 0.95,
-          "verbose": false,
-          "model": ["37", 0]
-        }
-      },
       "48": {
         "class_type": "ModelSamplingSD3",
         "inputs": {
           "shift": this.config.shift,
-          "model": ["60", 0]
+          "model": ["37", 0]
         }
       },
       "38": {
@@ -667,10 +660,14 @@ export class ComfyDreamProvider implements IDreamProvider {
         }
       },
       "8": {
-        "class_type": "VAEDecode",
+        "class_type": "VAEDecodeTiled",
         "inputs": {
           "samples": ["3", 0],
-          "vae": ["39", 0]
+          "vae": ["39", 0],
+          "tile_size": 512,
+          "overlap": 64,
+          "temporal_size": 64,
+          "temporal_overlap": 8
         }
       },
       "57": {
@@ -713,9 +710,9 @@ export class ComfyDreamProvider implements IDreamProvider {
     const promptId = queueData.prompt_id;
     console.log(`🚀 [ComfyDreamProvider] Prompt enqueued with ID: ${promptId}`);
 
-    // 5. Poll /history/{prompt_id} until completed (up to 300 seconds)
+    // 5. Poll /history/{prompt_id} until completed (configurable via WAN_VIDEO_TIMEOUT_MS)
     const startTime = Date.now();
-    const timeoutMs = 300_000;
+    const timeoutMs = this.config.videoTimeoutMs;
     let completedHistory: any = null;
 
     const progressListener = (msg: any) => {
@@ -733,7 +730,7 @@ export class ComfyDreamProvider implements IDreamProvider {
             detail: 'Allocating VRAM and initializing Wan 2.2 model...',
             percent: 5,
             elapsedSeconds: Math.round(elapsedSec),
-            etaSeconds: Math.round(videoFrames * 1.6)
+            etaSeconds: Math.round((videoFrames / 49) * 110)
           });
         } else if (msg.type === 'executing') {
           const node = data.node;
@@ -759,12 +756,12 @@ export class ComfyDreamProvider implements IDreamProvider {
           } else if (node === '8') {
             onProgress?.({
               stage: 'DECODING',
-              stageLabel: 'Neural VAE Decoding',
-              detail: `Decoding ${videoFrames} latent frames into RGB pixels...`,
+              stageLabel: 'Tiled Neural VAE Decoding',
+              detail: `Decoding ${videoFrames} latent frames into RGB pixels (tiled VAE)...`,
               percent: 88,
               elapsedSeconds: Math.round(elapsedSec),
-              etaSeconds: 6,
-              nodeType: 'VAEDecode'
+              etaSeconds: 12,
+              nodeType: 'VAEDecodeTiled'
             });
           } else if (node === '57' || node === '58') {
             onProgress?.({

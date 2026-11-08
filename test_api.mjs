@@ -104,6 +104,11 @@ async function runApiVerification() {
   assert(progressRes.headers.get('content-type')?.includes('text/event-stream'), 'Must serve text/event-stream');
   console.log('  ✓ Passed: SSE Live Progress endpoint returns 200 with text/event-stream header');
 
+  // 4c: SSE endpoint with non-existent session must return 404
+  const badProgressRes = await fetch(`${BASE_URL}/dreams/progress/non_existent_session`);
+  assert.strictEqual(badProgressRes.status, 404, 'SSE endpoint must return 404 for invalid dreamId');
+  console.log('  ✓ Passed: SSE Live Progress endpoint rejects invalid dreamId with 404');
+
   // 5. Keyframes Generation with Server-Locked Session
   console.log('\nTest 5: Keyframe generation requiring valid dreamId & verifying mock status');
   
