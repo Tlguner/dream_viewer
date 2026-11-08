@@ -34,10 +34,19 @@ const STORAGE_KEYFRAMES_DIR = path.join(STORAGE_DIR, 'keyframes');
 fs.mkdirSync(STORAGE_VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_KEYFRAMES_DIR, { recursive: true });
 
-// CORS: allow frontend clients
+// CORS: allow frontend clients (including Vite dev ports 5173-5179)
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 app.use(cors({
-  origin: [CLIENT_URL, 'http://127.0.0.1:5173', 'http://localhost:5173'],
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (
+      origin === CLIENT_URL ||
+      /^http:\/\/(localhost|127\.0\.0\.1):(517[3-9]|3000)$/.test(origin)
+    ) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS blocked origin: ${origin}`));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Range']
 }));
