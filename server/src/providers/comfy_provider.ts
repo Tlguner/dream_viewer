@@ -56,21 +56,94 @@ export class ComfyDreamProvider implements IDreamProvider {
 
   public async analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis> {
     const cleanText = this.sanitizeForPrompt(rawText);
-    const detectedMood = moodHint || 'ETHEREAL_LUCID';
+    const detectedMood: MoodStyle = moodHint || 'ETHEREAL_LUCID';
 
-    const refinedPrompt = `Surreal ethereal dreamscape: ${cleanText}. Volumetric fog, chromatic lighting, anamorphic lens flare, deep cosmic haze, solitary silhouette seen strictly from behind in shadows, no visible human face, magical realism, 35mm film grain, 8k cinematic masterpiece.`;
-    const cameraMotion = 'Slow forward dolly tracking push with hypnotic subtle rotational tilt and floating weightlessness';
+    let keyframePrompt = '';
+    let motionPrompt = '';
+    let cameraMotion = '';
+    let visualElements = {
+      setting: '',
+      surrealTwist: '',
+      lighting: ''
+    };
+
+    switch (detectedMood) {
+      case 'SURREAL_CYBERPUNK':
+        keyframePrompt = `Wide aerial establishing shot of a futuristic cyberpunk megacity at night: ${cleanText}. Dozens of towering dark skyscrapers stretching to the horizon, giant neon billboards on facades in vibrant cyan and magenta, small flying cars with glowing headlights between towers, clean wet reflective surfaces, sharp architectural geometry, photorealistic sharp detail.`;
+        motionPrompt = 'Slow steady forward drone flight over the futuristic city. Flying vehicles glide slowly through the frame between skyscrapers, neon signs softly flicker, light rain drifts smoothly. Continuous 24fps motion.';
+        cameraMotion = 'Slow forward aerial drone glide between skyscrapers';
+        visualElements = {
+          setting: 'Dense vertical megacity with towering brutalist skyscrapers and skybridges',
+          surrealTwist: 'Holographic neon advertisements and airborne transit lanes',
+          lighting: 'High-contrast cyan and magenta neon illumination with clean wet reflections'
+        };
+        break;
+
+      case 'NOSTALGIC_FOG':
+        keyframePrompt = `Vintage 35mm film still: ${cleanText}. Muted color palette, nostalgic atmospheric dreamscape, soft rim light, clean focal composition, fine film grain, evocative cinema aesthetic.`;
+        motionPrompt = 'Slow contemplative camera push forward. Soft atmospheric dust motes gently drifting, subtle ambient light shifting, smooth calm motion.';
+        cameraMotion = 'Slow contemplative dolly tracking push';
+        visualElements = {
+          setting: 'Misty nostalgic landscape with vintage timeless architecture',
+          surrealTwist: 'Dreamlike memories suspended in soft atmospheric light',
+          lighting: 'Muted warm dawn glow with soft cinematic shadows'
+        };
+        break;
+
+      case 'DEEP_OCEAN':
+        keyframePrompt = `Deep oceanic abyss: ${cleanText}. Underwater bioluminescent glow in azure and deep indigo, floating aquatic structures, shimmering caustic light patterns dancing across surfaces, cinematic wide angle, sharp detail.`;
+        motionPrompt = 'Submerged underwater slow forward drift. Floating bioluminescent plankton swirling gently, flowing fluid currents, smooth underwater camera motion.';
+        cameraMotion = 'Submerged fluid forward drift with gentle vertical sway';
+        visualElements = {
+          setting: 'Submerged oceanic abyss with colossal bioluminescent architecture',
+          surrealTwist: 'Weightless aquatic dreamscape with floating luminescent elements',
+          lighting: 'Deep indigo water with vibrant bioluminescent cyan caustics'
+        };
+        break;
+
+      case 'FLOATING_SKY':
+        keyframePrompt = `High altitude panoramic view: ${cleanText}. Floating architectural monoliths above expansive golden clouds, brilliant daylight, vast infinite horizon, crisp architectural edges, cinematic scale.`;
+        motionPrompt = 'Smooth aerial gliding flight above the cloud deck. Slow floating motion of architectural structures, drifting clouds, majestic wide camera glide.';
+        cameraMotion = 'High altitude aerial forward glide with wide panoramic view';
+        visualElements = {
+          setting: 'Vast cloudscape horizon with colossal floating structures',
+          surrealTwist: 'Gravity-defying architecture floating effortlessly above the clouds',
+          lighting: 'Brilliant golden daylight casting sharp sunbeams across clouds'
+        };
+        break;
+
+      case 'GOLDEN_DREAM':
+        keyframePrompt = `Golden hour cinematic masterpiece: ${cleanText}. Warm amber and gilded sunlight, rich rim lighting, long dramatic shadows, atmospheric warmth, crisp focal elements, photorealistic quality.`;
+        motionPrompt = 'Slow golden hour camera push. Shifting golden light rays, soft floating dust particles in sunbeams, smooth majestic motion.';
+        cameraMotion = 'Majestic slow forward dolly push into the golden light';
+        visualElements = {
+          setting: 'Luminous dream realm bathed in eternal sunset',
+          surrealTwist: 'Gilded surreal structures radiating warm amber light',
+          lighting: 'Rich golden hour rim lighting with deep amber warmth'
+        };
+        break;
+
+      case 'ETHEREAL_LUCID':
+      default:
+        keyframePrompt = `Lucid dream vision: ${cleanText}. Ethereal twilight illumination, clean surreal architectural composition, iridescent accents, crisp subject focus, magical realism, cinematic wide shot.`;
+        motionPrompt = 'Smooth weightless forward drift. Gentle shimmering light particles, subtle environmental motion, hypnotic calm cinematic movement.';
+        cameraMotion = 'Slow forward tracking push with gentle weightless float';
+        visualElements = {
+          setting: 'Luminous surreal horizon with dream architecture',
+          surrealTwist: 'Weightless gravity-defying forms and iridescent light',
+          lighting: 'Soft twilight radiance with clean atmospheric clarity'
+        };
+        break;
+    }
 
     return {
-      refinedPrompt,
+      refinedPrompt: keyframePrompt,
+      keyframePrompt,
+      motionPrompt,
       negativePrompt: SafetyShield.getNegativePrompt(),
       cameraMotion,
       detectedMood,
-      visualElements: {
-        setting: 'Floating architectural horizon enveloped in luminous twilight mist',
-        surrealTwist: 'Gravity-defying elements rippling with iridescent light particles',
-        lighting: 'Volumetric bioluminescent beams and deep atmospheric shadows'
-      }
+      visualElements
     };
   }
 
@@ -114,7 +187,7 @@ export class ComfyDreamProvider implements IDreamProvider {
    * In Comfy mode, this does NOT fall back to Unsplash stock photos.
    * Generates `count` distinct seeds in a single cached ComfyUI execution graph.
    */
-  public async generateKeyframes(refinedPrompt: string, count: number = 3): Promise<KeyframeOption[]> {
+  public async generateKeyframes(keyframePrompt: string, count: number = 3): Promise<KeyframeOption[]> {
     console.log(`🎨 [ComfyDreamProvider] Generating ${count} genuine GPU keyframes via Wan 2.2...`);
 
     const baseSeed = Math.floor(Math.random() * 8000000000000000);
@@ -160,14 +233,14 @@ export class ComfyDreamProvider implements IDreamProvider {
       "6": {
         "class_type": "CLIPTextEncode",
         "inputs": {
-          "text": this.sanitizeForPrompt(refinedPrompt),
+          "text": this.sanitizeForPrompt(keyframePrompt),
           "clip": ["38", 0]
         }
       },
       "7": {
         "class_type": "CLIPTextEncode",
         "inputs": {
-          "text": "nsfw, nude, naked, erotic, gore, blood, violence, close-up human face, cartoon, flat lighting, blurry, low resolution, watermark",
+          "text": `${SafetyShield.getNegativePrompt()}, blurry, low resolution, flat lighting, muddy textures, deformed, oversaturated, obscuring thick fog, dark smear, watermark, cartoon, 3d render`,
           "clip": ["38", 0]
         }
       },
@@ -374,8 +447,8 @@ export class ComfyDreamProvider implements IDreamProvider {
    */
   public async generateVideo(
     selectedKeyframe: KeyframeOption,
-    prompt: string,
-    _cameraMotion: string
+    motionPrompt: string,
+    cameraMotion: string
   ): Promise<DreamVideoResult> {
     console.log(`📡 [ComfyDreamProvider] Starting Image-to-Video generation on ComfyUI at ${this.comfyHost}...`);
 
@@ -433,14 +506,14 @@ export class ComfyDreamProvider implements IDreamProvider {
       "6": {
         "class_type": "CLIPTextEncode",
         "inputs": {
-          "text": this.sanitizeForPrompt(prompt),
+          "text": this.sanitizeForPrompt(`${motionPrompt}. ${cameraMotion}. Smooth motion, high temporal coherence, 24fps.`),
           "clip": ["38", 0]
         }
       },
       "7": {
         "class_type": "CLIPTextEncode",
         "inputs": {
-          "text": "nsfw, nude, naked, erotic, gore, blood, violence, close-up human face, cartoon, 3d render, cgi, flat lighting, blurry, low resolution, watermark",
+          "text": `${SafetyShield.getNegativePrompt()}, jitter, morphing, sudden camera cuts, flashing distortion, warped geometry, rapid flicker, frozen frame, watermark, blurry`,
           "clip": ["38", 0]
         }
       },

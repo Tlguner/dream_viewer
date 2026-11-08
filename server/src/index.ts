@@ -229,6 +229,8 @@ app.post('/api/dreams/analyze', async (req, res) => {
       userId: demoUser.id,
       rawText: rawDreamText,
       refinedPrompt: analysis.refinedPrompt,
+      keyframePrompt: analysis.keyframePrompt,
+      motionPrompt: analysis.motionPrompt,
       negativePrompt: analysis.negativePrompt,
       cameraMotion: analysis.cameraMotion,
       mood: analysis.detectedMood,
@@ -284,8 +286,8 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       // Refresh TTL
       session.expiresAt = Date.now() + SESSION_TTL_MS;
 
-      // Generate keyframes using server-locked prompt
-      const keyframes = await dreamProvider.generateKeyframes(session.refinedPrompt, count);
+      // Generate keyframes using server-locked scene prompt
+      const keyframes = await dreamProvider.generateKeyframes(session.keyframePrompt || session.refinedPrompt, count);
       session.keyframes = keyframes;
       session.status = 'keyframes_ready';
 
@@ -363,7 +365,7 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     // Generate video (persisted inside server storage and served through /api/media/videos/)
     const video = await dreamProvider.generateVideo(
       approvedKeyframe,
-      session.refinedPrompt,
+      session.motionPrompt || session.refinedPrompt,
       session.cameraMotion
     );
 

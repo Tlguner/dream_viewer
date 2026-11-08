@@ -14,7 +14,9 @@ export interface ModerationResult {
 }
 
 export interface DreamPromptAnalysis {
-  refinedPrompt: string;
+  refinedPrompt: string;       // Legacy / unified prompt
+  keyframePrompt: string;      // Dedicated scene composition & sharp visual subject prompt
+  motionPrompt: string;        // Dedicated temporal animation & camera motion prompt
   negativePrompt: string;
   cameraMotion: string;
   detectedMood: MoodStyle;
@@ -52,6 +54,8 @@ export interface DreamSession {
   userId: string;
   rawText: string;
   refinedPrompt: string;
+  keyframePrompt: string;
+  motionPrompt: string;
   negativePrompt: string;
   cameraMotion: string;
   mood: MoodStyle;
@@ -66,6 +70,6 @@ export interface IDreamProvider {
   name: string;
   isMock: boolean;
   analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamPromptAnalysis>;
-  generateKeyframes(refinedPrompt: string, count?: number): Promise<KeyframeOption[]>;
-  generateVideo(selectedKeyframe: KeyframeOption, prompt: string, cameraMotion: string): Promise<DreamVideoResult>;
+  generateKeyframes(keyframePrompt: string, count?: number): Promise<KeyframeOption[]>;
+  generateVideo(selectedKeyframe: KeyframeOption, motionPrompt: string, cameraMotion: string): Promise<DreamVideoResult>;
 }

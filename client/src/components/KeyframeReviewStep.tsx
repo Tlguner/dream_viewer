@@ -12,6 +12,8 @@ interface Keyframe {
 
 interface AnalysisData {
   refinedPrompt: string;
+  keyframePrompt?: string;
+  motionPrompt?: string;
   negativePrompt: string;
   cameraMotion: string;
   detectedMood: string;
@@ -86,7 +88,7 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
       <div className="glass-panel rounded-2xl p-5 mb-8 border border-purple-500/30">
         <div className="flex items-center gap-2 text-xs font-semibold text-purple-300 uppercase tracking-wider mb-3">
           <Camera className="w-4 h-4 text-cyan-400" />
-          <span>Dream Architect Directive</span>
+          <span>Dream Architect Directives</span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4 text-xs">
@@ -104,11 +106,22 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
           </div>
         </div>
 
-        <div className="bg-[#090b1c] p-3 rounded-xl border border-purple-500/20 text-xs text-slate-300 flex items-start gap-2">
-          <Eye className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
-          <div>
-            <span className="font-semibold text-purple-200">Cinematic Prompt: </span>
-            <span>"{analysis.refinedPrompt}"</span>
+        {/* Decoupled Directives: Keyframe Scene vs Video Animation */}
+        <div className="space-y-2 text-xs">
+          <div className="bg-[#090b1c] p-3 rounded-xl border border-cyan-500/20 text-slate-300 flex items-start gap-2">
+            <Eye className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold text-cyan-200">Scene Directive (Keyframe): </span>
+              <span className="text-slate-300">"{analysis.keyframePrompt || analysis.refinedPrompt}"</span>
+            </div>
+          </div>
+
+          <div className="bg-[#090b1c] p-3 rounded-xl border border-purple-500/20 text-slate-300 flex items-start gap-2">
+            <Video className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold text-purple-200">Animation Motion (I2V): </span>
+              <span className="text-slate-300">"{analysis.motionPrompt || analysis.cameraMotion}"</span>
+            </div>
           </div>
         </div>
       </div>
