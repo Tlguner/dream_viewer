@@ -110,7 +110,7 @@ async function runApiVerification() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      rawDreamText: 'Derin sularda yüzüyordum, kendimi sisli bir çam ormanında buldum',
+      rawDreamText: 'Derin sularda yüzüyordum || Sisli bir çam ormanında buldum',
       moodHint: 'DEEP_OCEAN'
     })
   });

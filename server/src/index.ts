@@ -10,7 +10,7 @@ import { SafetyShield } from './moderation/shield.js';
 import { MockDreamProvider } from './providers/mock_provider.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
 import { IDreamArchitect, OpenAICompatibleArchitect, MockDreamArchitect } from './architect/index.js';
-import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent, VideoJobData, DreamVideoResult } from './types/index.js';
+import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent, GpuJobData, KeyframeJobData, VideoJobData, DreamVideoResult, KeyframeOption } from './types/index.js';
 import { createDreamQueue, IDreamQueue } from './queue/dream_queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -127,9 +127,6 @@ function emitDreamProgress(dreamId: string, event: DreamProgressEvent) {
   }
 }
 
-// Concurrency guard: Only 1 active generation allowed on single local GPU (videos & keyframes)
-let isGpuBusy = false;
-
 // Evict expired sessions periodically (1-hour TTL) and clean up progress maps
 const SESSION_TTL_MS = 60 * 60 * 1000;
 setInterval(() => {
@@ -203,19 +200,29 @@ const GenerateVideoSchema = z.object({
   dreamTitle: z.string().max(100).optional()
 });
 
-// Health check with honest provider and architect info
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'online',
-    timestamp: new Date().toISOString(),
-    provider: dreamProvider.name,
-    providerType,
-    architect: dreamArchitect.name,
-    architectType,
-    isMock: dreamProvider.isMock,
-    isGpuBusy,
-    environment: process.env.NODE_ENV || 'development'
-  });
+// Health check with honest provider, architect, and GPU queue status
+app.get(['/health', '/api/health'], async (req, res) => {
+  try {
+    const queueStats = await dreamQueue.getQueueStats();
+    const isGpuActive = queueStats.active > 0;
+    res.json({
+      status: 'online',
+      timestamp: new Date().toISOString(),
+      provider: dreamProvider.name,
+      providerType,
+      architect: dreamArchitect.name,
+      architectType,
+      isMock: dreamProvider.isMock,
+      isGpuBusy: isGpuActive,
+      queue: queueStats,
+      gpu: {
+        isBusy: isGpuActive
+      },
+      environment: process.env.NODE_ENV || 'development'
+    });
+  } catch (err: any) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
 });
 
 // SSE Progress Endpoint: Stream live real-time generation progress to frontend
@@ -275,30 +282,7 @@ app.get('/api/dreams/progress/:dreamId', (req, res) => {
   });
 });
 
-// System Health & Queue Driver Transparency
-app.get(['/health', '/api/health'], async (req, res) => {
-  try {
-    const queueStats = await dreamQueue.getQueueStats();
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      queue: queueStats,
-      gpu: {
-        isBusy: isGpuBusy
-      },
-      provider: {
-        name: dreamProvider.name,
-        isMock: dreamProvider.isMock
-      },
-      architect: {
-        name: dreamArchitect.name,
-        isMock: dreamArchitect.isMock
-      }
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
+
 
 // User Profile & Credits with Atomic Available Calculation
 app.get('/api/user/profile', (req, res) => {
@@ -395,6 +379,7 @@ app.post('/api/dreams/analyze', async (req, res) => {
 });
 
 // Step 2: Generate Keyframe Previews (Server session locked + GPU concurrency lock)
+// Step 2: Generate Keyframe Previews (Server session locked + GPU queue concurrency guard)
 app.post('/api/dreams/keyframes', async (req, res) => {
   try {
     const parseResult = KeyframesSchema.safeParse(req.body);
@@ -414,41 +399,96 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       });
     }
 
-    // GPU concurrency guard: prevent concurrent jobs on 8GB VRAM
-    if (isGpuBusy) {
-      return res.status(429).json({
-        error: 'GPU_BUSY',
-        message: 'The local GPU is currently busy synthesizing another vision or video. Please wait a moment.'
+    // Session duplicate lock: Prevent overlapping generation on the same session
+    if (session.status === 'generating' || session.status === 'queued') {
+      return res.status(409).json({
+        error: 'GENERATION_IN_PROGRESS',
+        message: 'A generation job is already active or queued for this dream session. Please wait.'
       });
     }
 
-    isGpuBusy = true;
-    try {
-      // Refresh TTL
-      session.expiresAt = Date.now() + SESSION_TTL_MS;
+    // Refresh TTL
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
 
-      // Generate keyframes using server-locked scene prompt with live progress
-      const keyframes = await dreamProvider.generateKeyframes(
-        session.keyframePrompt || session.refinedPrompt, 
-        count,
-        (prog) => emitDreamProgress(dreamId, prog)
-      );
-      session.keyframes = keyframes;
-      session.status = 'keyframes_ready';
+    const jobId = `kf_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+    session.status = 'queued';
+    session.activeJobId = jobId;
 
-      res.json({
-        success: true,
-        dreamId,
-        keyframes
-      });
-    } finally {
-      isGpuBusy = false;
-    }
+    // Enqueue keyframe generation into unified GPU queue (strictly concurrency: 1 with videos)
+    const { queuePosition } = await dreamQueue.addJob({
+      jobType: 'KEYFRAMES',
+      jobId,
+      dreamId,
+      prompt: session.keyframePrompt || session.refinedPrompt,
+      count,
+      enqueuedAt: Date.now()
+    });
+
+    emitDreamProgress(dreamId, {
+      stage: 'QUEUED',
+      stageLabel: `Keyframes Queued (Position #${queuePosition})`,
+      detail: queuePosition === 1 ? 'Next up on GPU' : `${queuePosition - 1} job(s) ahead in GPU queue`,
+      percent: 0,
+      elapsedSeconds: 0,
+      jobId,
+      queuePosition
+    });
+
+    // Wait for the keyframe job to be processed by the single GPU worker
+    const keyframes = await dreamQueue.waitForJobResult<KeyframeOption[]>(jobId);
+
+    res.json({
+      success: true,
+      dreamId,
+      keyframes
+    });
   } catch (error: any) {
     console.error('Error generating keyframes:', error);
     res.status(500).json({ error: 'FAILED_TO_GENERATE_KEYFRAMES', message: error.message });
   }
 });
+
+// Worker Keyframes Processing Function (Concurrency: 1 on GPU)
+async function processKeyframesJob(jobData: KeyframeJobData, updateJobProgress: (prog: DreamProgressEvent) => void): Promise<KeyframeOption[]> {
+  const session = dreamSessions.get(jobData.dreamId);
+  if (!session) {
+    throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
+  }
+
+  session.status = 'generating';
+  try {
+    const keyframes = await dreamProvider.generateKeyframes(
+      jobData.prompt,
+      jobData.count,
+      (prog) => {
+        const enrichedProg: DreamProgressEvent = {
+          ...prog,
+          jobId: jobData.jobId,
+          queuePosition: 0
+        };
+        emitDreamProgress(session.dreamId, enrichedProg);
+        updateJobProgress(enrichedProg);
+      }
+    );
+
+    session.keyframes = keyframes;
+    session.status = 'keyframes_ready';
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
+
+    return keyframes;
+  } catch (err: any) {
+    session.status = 'analyzed'; // Revert back to analyzed on error so user can retry
+    emitDreamProgress(session.dreamId, {
+      stage: 'ERROR',
+      stageLabel: 'Keyframe Synthesis Failed',
+      detail: err.message,
+      percent: 0,
+      elapsedSeconds: 0,
+      jobId: jobData.jobId
+    });
+    throw err;
+  }
+}
 
 // Worker Video Processing Function (Concurrency: 1 on GPU)
 async function processVideoJob(jobData: VideoJobData, updateJobProgress: (prog: DreamProgressEvent) => void): Promise<DreamVideoResult> {
@@ -466,7 +506,6 @@ async function processVideoJob(jobData: VideoJobData, updateJobProgress: (prog: 
   }
 
   session.status = 'generating';
-  isGpuBusy = true;
 
   try {
     const video = await dreamProvider.generateVideo(
@@ -531,8 +570,15 @@ async function processVideoJob(jobData: VideoJobData, updateJobProgress: (prog: 
       jobId: jobData.jobId
     });
     throw err;
-  } finally {
-    isGpuBusy = false;
+  }
+}
+
+// Master Unified GPU Processor (Strict Concurrency: 1 on local GPU)
+async function processGpuJob(jobData: GpuJobData, updateJobProgress: (prog: DreamProgressEvent) => void): Promise<any> {
+  if (jobData.jobType === 'KEYFRAMES') {
+    return processKeyframesJob(jobData, updateJobProgress);
+  } else {
+    return processVideoJob(jobData, updateJobProgress);
   }
 }
 
@@ -591,6 +637,7 @@ app.post('/api/dreams/generate-video', async (req, res) => {
   session.activeJobId = jobId;
 
   const { queuePosition } = await dreamQueue.addJob({
+    jobType: 'VIDEO',
     jobId,
     dreamId,
     userId: demoUser.id,
@@ -661,8 +708,8 @@ app.get('/api/dreams/recent', (req, res) => {
 
 // Strict Server Startup with Queue Initialization
 async function startServer() {
-  // Initialize Dream Queue (validates Redis if QUEUE_DRIVER=bullmq, or boots memory queue if QUEUE_DRIVER=memory)
-  dreamQueue = await createDreamQueue(processVideoJob);
+  // Initialize Unified Dream GPU Queue (concurrency: 1 for keyframes & videos)
+  dreamQueue = await createDreamQueue(processGpuJob);
 
   app.listen(Number(PORT), HOST, () => {
     console.log(`✨ Dream Viewer Server active on http://${HOST}:${PORT}`);

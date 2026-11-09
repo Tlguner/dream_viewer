@@ -212,32 +212,25 @@ export class MockDreamArchitect implements IDreamArchitect {
 
     const defaultMood = moodHint || 'ETHEREAL_LUCID';
 
-    // 2. Generic multi-scene test detection for CI (Ocean -> Forest)
-    const hasOcean = lower.includes('deniz') || lower.includes('ocean');
-    const hasForest = lower.includes('orman') || lower.includes('forest');
-
-    if (hasOcean && hasForest) {
-      return {
-        safety: { allowed: true, category: null },
-        scenes: [
-          {
-            sceneNumber: 1,
-            summary: 'Derin Sularda Yüzüş',
-            mood: 'DEEP_OCEAN',
-            keyframePrompt: 'Submerged view of an oceanic abyss with caustic sunbeams dancing through azure waters, cinematic scale, high clarity.',
-            motionPrompt: 'Slow forward camera push through the water, floating particles drifting gently, smooth 24fps motion.',
-            cameraMotion: 'Submerged fluid forward drift'
-          },
-          {
-            sceneNumber: 2,
-            summary: 'Sisli Çam Ormanına Geçiş',
-            mood: 'NOSTALGIC_FOG',
-            keyframePrompt: 'Dense pine forest shrouded in atmospheric morning mist, soft dawn glow through trees, mossy earth, cinematic depth.',
-            motionPrompt: 'Slow steady camera tracking push along a misty forest path, calm ambient motion, 24fps.',
-            cameraMotion: 'Slow forward tracking push'
-          }
-        ]
-      };
+    // 2. Explicit delimiter splitting rule for tests & CI pipelines:
+    // When text contains '||', each segment represents a distinct scene (clamped to 1..3 scenes).
+    // Anlamsal / semantic accuracy is tested by eval suites; pipeline validation uses this explicit delimiter.
+    if (rawText.includes('||')) {
+      const parts = rawText.split('||').map(p => p.trim()).filter(Boolean);
+      const clampedParts = parts.slice(0, 3);
+      if (clampedParts.length > 0) {
+        return {
+          safety: { allowed: true, category: null },
+          scenes: clampedParts.map((part, index) => ({
+            sceneNumber: index + 1,
+            summary: part.length > 40 ? part.substring(0, 40) + '...' : part,
+            mood: defaultMood,
+            keyframePrompt: `${part}. Cinematic composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
+            motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${part}. Smooth continuous 24fps camera motion.`,
+            cameraMotion: 'Slow forward tracking push with gentle weightless float'
+          }))
+        };
+      }
     }
 
     // Default Single Scene for CI

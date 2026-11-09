@@ -109,7 +109,19 @@ export type ProgressCallback = (progress: DreamProgressEvent) => void;
 
 export type QueueDriverType = 'bullmq' | 'memory';
 
+export type GpuJobType = 'KEYFRAMES' | 'VIDEO';
+
+export interface KeyframeJobData {
+  jobType: 'KEYFRAMES';
+  jobId: string;
+  dreamId: string;
+  prompt: string;
+  count: number;
+  enqueuedAt: number;
+}
+
 export interface VideoJobData {
+  jobType: 'VIDEO';
   jobId: string;
   dreamId: string;
   userId: string;
@@ -119,9 +131,12 @@ export interface VideoJobData {
   enqueuedAt: number;
 }
 
-export interface VideoJobStatusResponse {
+export type GpuJobData = KeyframeJobData | VideoJobData;
+
+export interface GpuJobStatusResponse {
   jobId: string;
   dreamId: string;
+  jobType: GpuJobType;
   status: 'queued' | 'rendering' | 'completed' | 'failed';
   queuePosition: number;
   progress: number;
@@ -129,9 +144,12 @@ export interface VideoJobStatusResponse {
   totalScenes: number;
   stageLabel: string;
   videoUrl?: string;
-  result?: DreamVideoResult;
+  keyframes?: KeyframeOption[];
+  result?: DreamVideoResult | KeyframeOption[];
   error?: string;
 }
+
+export type VideoJobStatusResponse = GpuJobStatusResponse;
 
 export interface IDreamProvider {
   name: string;

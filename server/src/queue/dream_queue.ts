@@ -2,35 +2,43 @@ import { Queue, Worker, Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import { 
   QueueDriverType, 
-  VideoJobData, 
-  VideoJobStatusResponse, 
+  GpuJobType,
+  GpuJobData, 
+  KeyframeJobData,
+  VideoJobData,
+  GpuJobStatusResponse, 
+  VideoJobStatusResponse,
   DreamVideoResult,
+  KeyframeOption,
   DreamProgressEvent 
 } from '../types/index.js';
 
 export type JobProcessor = (
-  jobData: VideoJobData, 
+  jobData: GpuJobData, 
   onProgress: (event: DreamProgressEvent) => void
-) => Promise<DreamVideoResult>;
+) => Promise<any>;
 
 export interface IDreamQueue {
   driver: QueueDriverType;
-  addJob(data: VideoJobData): Promise<{ jobId: string; queuePosition: number }>;
-  getJobStatus(jobId: string): Promise<VideoJobStatusResponse | null>;
+  addJob(data: GpuJobData): Promise<{ jobId: string; queuePosition: number }>;
+  waitForJobResult<T = any>(jobId: string): Promise<T>;
+  getJobStatus(jobId: string): Promise<GpuJobStatusResponse | null>;
   getQueueStats(): Promise<{ waiting: number; active: number; concurrency: number; driver: QueueDriverType }>;
   close(): Promise<void>;
 }
 
 /**
  * BullMQ Production Queue (Requires active Redis)
- * Strictly throws if Redis is unreachable when QUEUE_DRIVER=bullmq
+ * Strictly throws if Redis is unreachable on boot when QUEUE_DRIVER=bullmq
+ * Runtime client separates startup check from persistent reconnect strategy.
  */
 export class BullMQDreamQueue implements IDreamQueue {
   public driver: QueueDriverType = 'bullmq';
   private queue: Queue;
   private worker: Worker;
   private redisClient: Redis;
-  private jobStatuses = new Map<string, VideoJobStatusResponse>();
+  private jobStatuses = new Map<string, GpuJobStatusResponse>();
+  private jobDeferreds = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void; promise: Promise<any> }>();
 
   constructor(
     private redisHost: string,
@@ -38,50 +46,71 @@ export class BullMQDreamQueue implements IDreamQueue {
     private redisPassword: string | undefined,
     processor: JobProcessor
   ) {
+    // Runtime connection with resilient reconnect strategy (not fail-fast retryStrategy: null)
     this.redisClient = new Redis({
       host: redisHost,
       port: redisPort,
       password: redisPassword || undefined,
       maxRetriesPerRequest: null,
-      retryStrategy: () => null // Fail fast if unreachable
+      retryStrategy: (times) => {
+        console.warn(`⚠️ [BullMQ] Redis reconnect attempt #${times}...`);
+        return Math.min(times * 250, 3000);
+      }
     });
 
-    this.queue = new Queue('dream_video_jobs', {
+    this.queue = new Queue('dream_gpu_jobs', {
       connection: this.redisClient
     });
 
     this.worker = new Worker(
-      'dream_video_jobs',
-      async (job: Job<VideoJobData>) => {
-        console.log(`🎬 [BullMQ] Worker started processing video job ${job.data.jobId} for dream ${job.data.dreamId}`);
+      'dream_gpu_jobs',
+      async (job: Job<GpuJobData>) => {
+        const isKeyframes = job.data.jobType === 'KEYFRAMES';
+        console.log(`🎬 [BullMQ] Worker started processing ${job.data.jobType} job ${job.data.jobId} for dream ${job.data.dreamId} (Concurrency: 1)`);
+        
         this.updateJobState(job.data.jobId, {
           status: 'rendering',
           queuePosition: 0,
-          stageLabel: 'GPU Synthesis Started'
+          stageLabel: isKeyframes ? 'Generating Keyframe Visions on GPU' : 'GPU Video Synthesis Started'
         });
 
-        const result = await processor(job.data, (prog) => {
-          this.updateJobState(job.data.jobId, {
-            progress: prog.percent,
-            currentScene: prog.currentScene || 1,
-            totalScenes: prog.totalScenes || 1,
-            stageLabel: prog.stageLabel || prog.detail
+        const deferred = this.jobDeferreds.get(job.data.jobId);
+
+        try {
+          const result = await processor(job.data, (prog) => {
+            this.updateJobState(job.data.jobId, {
+              progress: prog.percent,
+              currentScene: prog.currentScene || 1,
+              totalScenes: prog.totalScenes || 1,
+              stageLabel: prog.stageLabel || prog.detail
+            });
+            job.updateProgress(prog.percent).catch(() => {});
           });
-          job.updateProgress(prog.percent).catch(() => {});
-        });
 
-        this.updateJobState(job.data.jobId, {
-          status: 'completed',
-          progress: 100,
-          videoUrl: result.videoUrl,
-          result
-        });
+          const patch: Partial<GpuJobStatusResponse> = {
+            status: 'completed',
+            progress: 100,
+            result
+          };
+          if (isKeyframes) {
+            patch.keyframes = result as KeyframeOption[];
+          } else {
+            patch.videoUrl = (result as DreamVideoResult).videoUrl;
+          }
 
-        return result;
+          this.updateJobState(job.data.jobId, patch);
+          deferred?.resolve(result);
+          return result;
+        } catch (err: any) {
+          deferred?.reject(err);
+          throw err;
+        } finally {
+          this.jobDeferreds.delete(job.data.jobId);
+        }
       },
       {
         connection: this.redisClient,
-        concurrency: 1 // Strict WAN 2.2 GPU concurrency guard: exactly 1 video rendering at a time
+        concurrency: 1 // Strict WAN 2.2 GPU concurrency guard: exactly 1 GPU task (video or keyframe) at a time
       }
     );
 
@@ -97,30 +126,49 @@ export class BullMQDreamQueue implements IDreamQueue {
   }
 
   public async initialize(): Promise<void> {
+    // Isolated startup probe to verify Redis availability immediately on startup
+    const probe = new Redis({
+      host: this.redisHost,
+      port: this.redisPort,
+      password: this.redisPassword || undefined,
+      maxRetriesPerRequest: null,
+      retryStrategy: () => null // Fail fast for initial health validation
+    });
+
     try {
-      const pong = await this.redisClient.ping();
+      const pong = await probe.ping();
       if (pong !== 'PONG') {
         throw new Error(`Unexpected Redis ping response: ${pong}`);
       }
-      console.log(`✅ [BullMQ] Connected to Redis on ${this.redisHost}:${this.redisPort} (Worker Concurrency: 1)`);
+      console.log(`✅ [BullMQ] Verified Redis on ${this.redisHost}:${this.redisPort} (Worker Concurrency: 1)`);
     } catch (err: any) {
       throw new Error(
         `[CRITICAL STARTUP ERROR] QUEUE_DRIVER="bullmq" requires an active Redis server at ${this.redisHost}:${this.redisPort}, ` +
         `but Redis connection failed: ${err.message}. ` +
         `Please start Redis (e.g. docker run -p 6379:6379 redis or Memurai) or explicitly configure QUEUE_DRIVER=memory in .env.`
       );
+    } finally {
+      try { await probe.quit(); } catch {}
     }
   }
 
-  private updateJobState(jobId: string, patch: Partial<VideoJobStatusResponse>) {
+  private updateJobState(jobId: string, patch: Partial<GpuJobStatusResponse>) {
     const current = this.jobStatuses.get(jobId);
     if (current) {
       this.jobStatuses.set(jobId, { ...current, ...patch });
     }
   }
 
-  public async addJob(data: VideoJobData): Promise<{ jobId: string; queuePosition: number }> {
-    const job = await this.queue.add('generate_video', data, {
+  public async addJob(data: GpuJobData): Promise<{ jobId: string; queuePosition: number }> {
+    let resolver!: (val: any) => void;
+    let rejecter!: (err: any) => void;
+    const promise = new Promise<any>((res, rej) => {
+      resolver = res;
+      rejecter = rej;
+    });
+    this.jobDeferreds.set(data.jobId, { resolve: resolver, reject: rejecter, promise });
+
+    await this.queue.add(data.jobType.toLowerCase(), data, {
       jobId: data.jobId,
       removeOnComplete: true,
       removeOnFail: false
@@ -129,9 +177,10 @@ export class BullMQDreamQueue implements IDreamQueue {
     const waitingCount = await this.queue.getWaitingCount();
     const queuePosition = waitingCount;
 
-    const initialStatus: VideoJobStatusResponse = {
+    const initialStatus: GpuJobStatusResponse = {
       jobId: data.jobId,
       dreamId: data.dreamId,
+      jobType: data.jobType,
       status: 'queued',
       queuePosition,
       progress: 0,
@@ -144,7 +193,22 @@ export class BullMQDreamQueue implements IDreamQueue {
     return { jobId: data.jobId, queuePosition };
   }
 
-  public async getJobStatus(jobId: string): Promise<VideoJobStatusResponse | null> {
+  public async waitForJobResult<T = any>(jobId: string): Promise<T> {
+    const deferred = this.jobDeferreds.get(jobId);
+    if (deferred) {
+      return deferred.promise as Promise<T>;
+    }
+    const status = this.jobStatuses.get(jobId);
+    if (status?.status === 'completed') {
+      return status.result as T;
+    }
+    if (status?.status === 'failed') {
+      throw new Error(status.error || 'Job failed');
+    }
+    throw new Error(`Job ${jobId} not found in deferred map`);
+  }
+
+  public async getJobStatus(jobId: string): Promise<GpuJobStatusResponse | null> {
     const cached = this.jobStatuses.get(jobId);
     if (!cached) return null;
 
@@ -181,31 +245,41 @@ export class BullMQDreamQueue implements IDreamQueue {
 }
 
 /**
- * In-Memory FIFO Queue (Explicitly chosen development driver)
- * Concurrency: 1 (Strictly processes jobs sequentially)
+ * In-Memory FIFO Queue (Default development driver)
+ * Concurrency: 1 (Strictly processes jobs sequentially on GPU)
  */
 export class MemoryDreamQueue implements IDreamQueue {
   public driver: QueueDriverType = 'memory';
-  private waitingQueue: VideoJobData[] = [];
-  private activeJob: VideoJobData | null = null;
-  private jobStatuses = new Map<string, VideoJobStatusResponse>();
+  private waitingQueue: GpuJobData[] = [];
+  private activeJob: GpuJobData | null = null;
+  private jobStatuses = new Map<string, GpuJobStatusResponse>();
+  private jobDeferreds = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void; promise: Promise<any> }>();
   private isProcessing = false;
 
   constructor(private processor: JobProcessor) {}
 
-  public async addJob(data: VideoJobData): Promise<{ jobId: string; queuePosition: number }> {
+  public async addJob(data: GpuJobData): Promise<{ jobId: string; queuePosition: number }> {
     this.waitingQueue.push(data);
     const queuePosition = this.waitingQueue.length;
 
-    const initialStatus: VideoJobStatusResponse = {
+    let resolver!: (val: any) => void;
+    let rejecter!: (err: any) => void;
+    const promise = new Promise<any>((res, rej) => {
+      resolver = res;
+      rejecter = rej;
+    });
+    this.jobDeferreds.set(data.jobId, { resolve: resolver, reject: rejecter, promise });
+
+    const initialStatus: GpuJobStatusResponse = {
       jobId: data.jobId,
       dreamId: data.dreamId,
+      jobType: data.jobType,
       status: 'queued',
       queuePosition,
       progress: 0,
       currentScene: 1,
       totalScenes: 1,
-      stageLabel: `Queued in Memory (Position #${queuePosition})`
+      stageLabel: `Queued in GPU Queue (Position #${queuePosition})`
     };
     this.jobStatuses.set(data.jobId, initialStatus);
 
@@ -213,6 +287,21 @@ export class MemoryDreamQueue implements IDreamQueue {
     this.processNextJob();
 
     return { jobId: data.jobId, queuePosition };
+  }
+
+  public async waitForJobResult<T = any>(jobId: string): Promise<T> {
+    const deferred = this.jobDeferreds.get(jobId);
+    if (deferred) {
+      return deferred.promise as Promise<T>;
+    }
+    const status = this.jobStatuses.get(jobId);
+    if (status?.status === 'completed') {
+      return status.result as T;
+    }
+    if (status?.status === 'failed') {
+      throw new Error(status.error || 'Job failed');
+    }
+    throw new Error(`Job ${jobId} not found in deferred map`);
   }
 
   private async processNextJob(): Promise<void> {
@@ -227,15 +316,18 @@ export class MemoryDreamQueue implements IDreamQueue {
     // Recalculate positions for remaining queued jobs
     this.updateWaitingPositions();
 
+    const isKeyframes = jobData.jobType === 'KEYFRAMES';
     const status = this.jobStatuses.get(jobData.jobId);
     if (status) {
       status.status = 'rendering';
       status.queuePosition = 0;
-      status.stageLabel = 'GPU Synthesis Started';
+      status.stageLabel = isKeyframes ? 'Generating Keyframe Visions on GPU' : 'GPU Video Synthesis Started';
     }
 
+    const deferred = this.jobDeferreds.get(jobData.jobId);
+
     try {
-      console.log(`🎬 [MemoryQueue] Processing video job ${jobData.jobId} for dream ${jobData.dreamId} (Concurrency: 1)`);
+      console.log(`🎬 [MemoryQueue] Processing ${jobData.jobType} job ${jobData.jobId} for dream ${jobData.dreamId} (Concurrency: 1)`);
       const result = await this.processor(jobData, (prog) => {
         const cur = this.jobStatuses.get(jobData.jobId);
         if (cur) {
@@ -250,17 +342,24 @@ export class MemoryDreamQueue implements IDreamQueue {
       if (finished) {
         finished.status = 'completed';
         finished.progress = 100;
-        finished.videoUrl = result.videoUrl;
+        if (isKeyframes) {
+          finished.keyframes = result as KeyframeOption[];
+        } else {
+          finished.videoUrl = (result as DreamVideoResult).videoUrl;
+        }
         finished.result = result;
       }
+      deferred?.resolve(result);
     } catch (err: any) {
-      console.error(`💥 [MemoryQueue] Job ${jobData.jobId} failed:`, err);
+      console.error(`💥 [MemoryQueue] Job ${jobData.jobId} (${jobData.jobType}) failed:`, err);
       const failed = this.jobStatuses.get(jobData.jobId);
       if (failed) {
         failed.status = 'failed';
         failed.error = err.message;
       }
+      deferred?.reject(err);
     } finally {
+      this.jobDeferreds.delete(jobData.jobId);
       this.activeJob = null;
       this.isProcessing = false;
       // Continue next job in FIFO queue
@@ -274,12 +373,12 @@ export class MemoryDreamQueue implements IDreamQueue {
       const s = this.jobStatuses.get(item.jobId);
       if (s) {
         s.queuePosition = i + 1;
-        s.stageLabel = `Queued in Memory (Position #${i + 1})`;
+        s.stageLabel = `Queued in GPU Queue (Position #${i + 1})`;
       }
     }
   }
 
-  public async getJobStatus(jobId: string): Promise<VideoJobStatusResponse | null> {
+  public async getJobStatus(jobId: string): Promise<GpuJobStatusResponse | null> {
     return this.jobStatuses.get(jobId) || null;
   }
 
@@ -312,7 +411,7 @@ export async function createDreamQueue(processor: JobProcessor): Promise<IDreamQ
 
     console.log(`📦 [DreamQueue] Initializing BullMQ with Redis at ${host}:${port}...`);
     const queue = new BullMQDreamQueue(host, port, password, processor);
-    await queue.initialize(); // Throws immediately if Redis is unreachable
+    await queue.initialize(); // Throws immediately if Redis is unreachable on boot
     return queue;
   }
 
