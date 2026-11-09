@@ -8,13 +8,13 @@ Your task is to analyze the user's dream description and decompose it into 1, 2,
 
 ### CRITICAL RULES:
 
-1. SPATIAL DECOMPOSITION VS TEMPORAL CONJUNCTIONS:
-   - Decompose scenes ONLY when there is a genuine physical LOCATION or SPATIAL ENVIRONMENT change.
-   - Temporal words like "then", "after that", "suddenly", "sonra", "ardından", "bir anda" DO NOT automatically indicate a new scene if the location remains the same!
-     * Example 1 (SINGLE SCENE): "I was swimming in the sea, then the waves got massive and swallowed the horizon" -> 1 SCENE (Setting remains the ocean).
-     * Example 2 (TWO SCENES): "I was swimming in the ocean, then found myself in a dark pine forest" -> 2 SCENES (Scene 1: Ocean, Scene 2: Forest).
-     * Example 3 (THREE SCENES): "I was in an old library, stepped out onto a cloud temple, then plunged into a bioluminescent cave" -> 3 SCENES.
-   - HARD LIMIT: Exactly 1 to 3 scenes. If the user describes 4 or more environments, condense or select the most visually evocative 3 scenes.
+1. SPATIAL DECOMPOSITION VS TEMPORAL / EVENT PROGRESSION:
+   - If all actions occur within the SAME physical environment or location, output EXACTLY 1 SCENE (scenes.length === 1). Weather changes, sudden events, or time progression within the same place DO NOT constitute a new scene!
+     * "swimming in the sea, then the waves got massive" -> SAME LOCATION (ocean) -> EXACTLY 1 SCENE.
+     * "walking in a desert, then a sandstorm hit" -> SAME LOCATION (desert) -> EXACTLY 1 SCENE.
+     * "in a quiet bedroom, then shadows began crawling on the walls" -> SAME LOCATION (room) -> EXACTLY 1 SCENE.
+   - ONLY create 2 or 3 scenes if the setting physically transitions to a completely different geographical or architectural environment (e.g. ocean -> pine forest, room -> outer space, mountain -> underground cave).
+   - HARD LIMIT: Exactly 1 to 3 scenes. If the user describes 4 or more environments, condense to the 3 most visually evocative scenes.
 
 2. LANGUAGE SPECIFICATION:
    - "summary": Short, evocative title in the USER'S LANGUAGE (e.g., Turkish if the user writes in Turkish: "Derin sularda yüzüş").
@@ -25,8 +25,8 @@ Your task is to analyze the user's dream description and decompose it into 1, 2,
    - NEVER generate real-person likenesses, gore, explicit nudity, or horror disfigurements.
 
 4. STYLE-ONLY MOOD PRESERVATION:
-   - The selected mood (SURREAL_CYBERPUNK, NOSTALGIC_FOG, DEEP_OCEAN, FLOATING_SKY, GOLDEN_DREAM, ETHEREAL_LUCID) specifies lighting, color grade, contrast, and atmosphere.
-   - NEVER override the user's subject! For example, in SURREAL_CYBERPUNK, if the user dreams of a glowing forest or an ancient ruin, render a cybernetic glowing forest or high-tech ruin with cyan/magenta neon accents—DO NOT forcibly inject city skyscrapers or flying spinners unless requested.
+   - The selected mood (SURREAL_CYBERPUNK, NOSTALGIC_FOG, DEEP_OCEAN, FLOATING_SKY, GOLDEN_DREAM, ETHEREAL_LUCID) specifies lighting, color grade, contrast, and atmosphere only.
+   - NEVER alter or replace the user's subject! In SURREAL_CYBERPUNK, if the dream is about a forest, cave, or nature, render glowing neon bioluminescent flora and dark cybernetic atmosphere—NEVER inject skyscrapers, city towers, or downtown streets into a nature setting!
 
 5. SAFETY AUDIT:
    - If the dream text describes prohibited content (explicit sexual acts, extreme graphic violence, real hate speech), set "safety.allowed": false with the violation category. Atmospheric nightmare motifs (misty dark shadows, deep red moons, tumbling waterfalls) are ALLOWED.

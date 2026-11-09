@@ -23,8 +23,9 @@ if (process.env.ARCHITECT_PROVIDER === 'mock') {
 }
 
 const BASE_URL = process.env.ARCHITECT_BASE_URL || 'http://127.0.0.1:1234/v1';
-const MODEL = process.env.ARCHITECT_MODEL || 'qwen2.5-7b-instruct';
+const MODEL = process.env.ARCHITECT_MODEL || 'qwen2.5-3b-instruct';
 const API_KEY = process.env.ARCHITECT_API_KEY || 'lm-studio';
+const TIMEOUT_MS = parseInt(process.env.ARCHITECT_TIMEOUT_MS || '60000', 10);
 
 const BENCHMARK_SCENARIOS = [
   {
@@ -247,7 +248,7 @@ async function runEvaluation() {
     process.exit(1);
   }
 
-  const architect = new OpenAICompatibleArchitect(BASE_URL, MODEL, API_KEY, 60000);
+  const architect = new OpenAICompatibleArchitect(BASE_URL, MODEL, API_KEY, TIMEOUT_MS);
 
   let passed = 0;
   let failed = 0;
