@@ -2,7 +2,7 @@ import React from 'react';
 import { Cpu, Sparkles, CheckCircle2, Clock, Activity, Zap, Layers, ShieldCheck } from 'lucide-react';
 
 export interface LiveProgress {
-  stage: 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
+  stage: 'QUEUED' | 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
   stageLabel: string;
   detail: string;
   percent: number;
@@ -11,6 +11,8 @@ export interface LiveProgress {
   elapsedSeconds: number;
   etaSeconds?: number;
   nodeType?: string;
+  queuePosition?: number;
+  jobId?: string;
 }
 
 interface ManifestingHUDProps {
@@ -86,6 +88,17 @@ export const ManifestingHUD: React.FC<ManifestingHUDProps> = ({
             <span>LIVE GPU FEED</span>
           </div>
         </div>
+
+        {/* Queue Position Banner if Waiting */}
+        {Boolean(progress?.queuePosition && progress.queuePosition > 0) && (
+          <div className="mb-4 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-mono flex items-center justify-between animate-pulse">
+            <span className="flex items-center gap-1.5 font-bold">
+              <Clock className="w-4 h-4 text-amber-400" />
+              <span>GPU Kuyruk Sırası: #{progress?.queuePosition}</span>
+            </span>
+            <span className="text-[10px] text-amber-400/80 uppercase tracking-wider font-semibold">Concurrency: 1</span>
+          </div>
+        )}
 
         {/* Big Digital Percentage Callout */}
         <div className="text-center my-4">

@@ -185,16 +185,58 @@ export function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Video generation failed');
 
-      if (data.remainingCredits !== undefined) {
+      if (data.availableCredits !== undefined) {
+        setCredits(data.availableCredits);
+      } else if (data.remainingCredits !== undefined) {
         setCredits(data.remainingCredits);
       }
 
-      const dreamResult = {
-        ...data.dream,
-        isMock: providerInfo.isMock
-      };
-      setCompletedDream(dreamResult);
-      setStep('PLAYER');
+      // Handle Asynchronous Queue Job (HTTP 202 Accepted)
+      if (res.status === 202 || data.status === 'queued') {
+        const jobId = data.jobId;
+        console.log(`🎬 Video generation job enqueued: ${jobId}. Waiting for worker synthesis...`);
+
+        // Resilient polling fallback alongside SSE
+        await new Promise<void>((resolve, reject) => {
+          const pollTimer = setInterval(async () => {
+            try {
+              const jobRes = await fetch(`${API_BASE}/dreams/jobs/${jobId}`);
+              if (jobRes.ok) {
+                const jobPayload = await jobRes.json();
+                if (jobPayload.job.status === 'completed' && jobPayload.dream) {
+                  clearInterval(pollTimer);
+                  const dreamResult = {
+                    ...jobPayload.dream,
+                    isMock: providerInfo.isMock
+                  };
+                  setCompletedDream(dreamResult);
+                  setStep('PLAYER');
+                  resolve();
+                } else if (jobPayload.job.status === 'failed') {
+                  clearInterval(pollTimer);
+                  reject(new Error(jobPayload.job.error || 'Video synthesis failed in queue'));
+                }
+              }
+            } catch (pollErr) {
+              // Ignore temporary network blips during polling
+            }
+          }, 2500);
+
+          // 15-minute timeout guard
+          setTimeout(() => {
+            clearInterval(pollTimer);
+            reject(new Error('Video generation timed out after 15 minutes.'));
+          }, 900000);
+        });
+      } else {
+        // Direct synchronous response fallback
+        const dreamResult = {
+          ...data.dream,
+          isMock: providerInfo.isMock
+        };
+        setCompletedDream(dreamResult);
+        setStep('PLAYER');
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Failed to generate dream video.');

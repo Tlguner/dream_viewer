@@ -82,13 +82,14 @@ export interface DreamSession {
   totalEstimatedSeconds: number;
   keyframes: KeyframeOption[];
   video?: DreamVideoResult;
-  status: 'draft' | 'analyzed' | 'keyframes_ready' | 'generating' | 'completed' | 'failed';
+  status: 'draft' | 'analyzed' | 'keyframes_ready' | 'queued' | 'generating' | 'completed' | 'failed';
+  activeJobId?: string;
   createdAt: string;
   expiresAt: number;
 }
 
 export interface DreamProgressEvent {
-  stage: 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
+  stage: 'QUEUED' | 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
   stageLabel: string;
   detail: string;
   percent: number;           // 0 to 100
@@ -97,9 +98,40 @@ export interface DreamProgressEvent {
   elapsedSeconds: number;
   etaSeconds?: number;
   nodeType?: string;
+  jobId?: string;
+  queuePosition?: number;
+  currentScene?: number;
+  totalScenes?: number;
+  result?: DreamVideoResult;
 }
 
 export type ProgressCallback = (progress: DreamProgressEvent) => void;
+
+export type QueueDriverType = 'bullmq' | 'memory';
+
+export interface VideoJobData {
+  jobId: string;
+  dreamId: string;
+  userId: string;
+  keyframeId: string;
+  dreamTitle?: string;
+  reservedCredits: number;
+  enqueuedAt: number;
+}
+
+export interface VideoJobStatusResponse {
+  jobId: string;
+  dreamId: string;
+  status: 'queued' | 'rendering' | 'completed' | 'failed';
+  queuePosition: number;
+  progress: number;
+  currentScene: number;
+  totalScenes: number;
+  stageLabel: string;
+  videoUrl?: string;
+  result?: DreamVideoResult;
+  error?: string;
+}
 
 export interface IDreamProvider {
   name: string;

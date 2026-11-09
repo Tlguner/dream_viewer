@@ -10,7 +10,8 @@ import { SafetyShield } from './moderation/shield.js';
 import { MockDreamProvider } from './providers/mock_provider.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
 import { IDreamArchitect, OpenAICompatibleArchitect, MockDreamArchitect } from './architect/index.js';
-import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent } from './types/index.js';
+import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent, VideoJobData, DreamVideoResult } from './types/index.js';
+import { createDreamQueue, IDreamQueue } from './queue/dream_queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -93,13 +94,16 @@ if (providerType === 'comfy') {
   );
 }
 
-// In-memory demo state for user credits
+// In-memory demo state for user credits with atomic reservation guard
 const demoUser = {
   id: 'usr_demo_101',
   username: 'DreamExplorer',
   credits: 10,
+  reservedCredits: 0,
   tier: 'Free Explorer'
 };
+
+let dreamQueue: IDreamQueue;
 
 // Stateful dream sessions: Prevents moderation bypass, prompt injection, and SSRF
 const dreamSessions = new Map<string, DreamSession>();
@@ -271,9 +275,37 @@ app.get('/api/dreams/progress/:dreamId', (req, res) => {
   });
 });
 
-// User Profile & Credits
+// System Health & Queue Driver Transparency
+app.get(['/health', '/api/health'], async (req, res) => {
+  try {
+    const queueStats = await dreamQueue.getQueueStats();
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      queue: queueStats,
+      gpu: {
+        isBusy: isGpuBusy
+      },
+      provider: {
+        name: dreamProvider.name,
+        isMock: dreamProvider.isMock
+      },
+      architect: {
+        name: dreamArchitect.name,
+        isMock: dreamArchitect.isMock
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// User Profile & Credits with Atomic Available Calculation
 app.get('/api/user/profile', (req, res) => {
-  res.json(demoUser);
+  res.json({
+    ...demoUser,
+    availableCredits: Math.max(0, demoUser.credits - demoUser.reservedCredits)
+  });
 });
 
 // Self-Hosted Media Serving: Videos using Express native res.sendFile
@@ -418,8 +450,94 @@ app.post('/api/dreams/keyframes', async (req, res) => {
   }
 });
 
-// Step 3: Animate Approved Keyframe into Dream Video (Image-to-Video)
-// Protected against double-clicks, race conditions, and GPU OOM
+// Worker Video Processing Function (Concurrency: 1 on GPU)
+async function processVideoJob(jobData: VideoJobData, updateJobProgress: (prog: DreamProgressEvent) => void): Promise<DreamVideoResult> {
+  const session = dreamSessions.get(jobData.dreamId);
+  if (!session) {
+    // Refund credit reservation if session vanished
+    demoUser.reservedCredits = Math.max(0, demoUser.reservedCredits - jobData.reservedCredits);
+    throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
+  }
+
+  const approvedKeyframe = session.keyframes.find(k => k.id === jobData.keyframeId);
+  if (!approvedKeyframe) {
+    demoUser.reservedCredits = Math.max(0, demoUser.reservedCredits - jobData.reservedCredits);
+    throw new Error(`Approved keyframe ${jobData.keyframeId} not found in session.`);
+  }
+
+  session.status = 'generating';
+  isGpuBusy = true;
+
+  try {
+    const video = await dreamProvider.generateVideo(
+      approvedKeyframe,
+      session.motionPrompt || session.refinedPrompt,
+      session.cameraMotion,
+      (prog) => {
+        const enrichedProg: DreamProgressEvent = {
+          ...prog,
+          jobId: jobData.jobId,
+          queuePosition: 0,
+          currentScene: 1,
+          totalScenes: session.scenes?.length || 1
+        };
+        emitDreamProgress(session.dreamId, enrichedProg);
+        updateJobProgress(enrichedProg);
+      }
+    );
+
+    // Finalize credit deduction ONLY upon verified successful synthesis
+    demoUser.credits -= jobData.reservedCredits;
+    demoUser.reservedCredits -= jobData.reservedCredits;
+
+    const completedDream = {
+      id: session.dreamId,
+      title: jobData.dreamTitle || 'Untitled Vision',
+      keyframeUrl: approvedKeyframe.imageUrl,
+      video,
+      prompt: session.refinedPrompt,
+      createdAt: new Date().toISOString()
+    };
+
+    session.video = video;
+    session.status = 'completed';
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    recentDreams.unshift(completedDream);
+
+    emitDreamProgress(session.dreamId, {
+      stage: 'COMPLETED',
+      stageLabel: 'Dream Manifestation Complete',
+      detail: 'Video generated successfully',
+      percent: 100,
+      elapsedSeconds: video.durationSeconds,
+      jobId: jobData.jobId,
+      queuePosition: 0,
+      currentScene: 1,
+      totalScenes: session.scenes?.length || 1,
+      result: video
+    });
+
+    return video;
+  } catch (err: any) {
+    session.status = 'failed';
+    // Atomic refund of credit reservation on generation failure
+    demoUser.reservedCredits = Math.max(0, demoUser.reservedCredits - jobData.reservedCredits);
+    emitDreamProgress(session.dreamId, {
+      stage: 'ERROR',
+      stageLabel: 'Synthesis Failed',
+      detail: err.message,
+      percent: 0,
+      elapsedSeconds: 0,
+      jobId: jobData.jobId
+    });
+    throw err;
+  } finally {
+    isGpuBusy = false;
+  }
+}
+
+// Step 3: Animate Approved Keyframe into Dream Video (Asynchronous Queue Architecture)
+// Dispatches job to queue, atomically reserves credits, and immediately returns HTTP 202 Accepted
 app.post('/api/dreams/generate-video', async (req, res) => {
   const parseResult = GenerateVideoSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -434,27 +552,19 @@ app.post('/api/dreams/generate-video', async (req, res) => {
   if (!session) {
     return res.status(404).json({
       error: 'SESSION_NOT_FOUND',
-      message: 'Dream session expired or invalid.'
+      message: 'Dream session expired or invalid. Please re-analyze your dream.'
     });
   }
 
   // 1. Session-level lock: Prevent duplicate concurrent requests on the same session (409 Conflict)
-  if (session.status === 'generating') {
+  if (session.status === 'generating' || session.status === 'queued') {
     return res.status(409).json({
       error: 'GENERATION_IN_PROGRESS',
-      message: 'A video generation is already underway for this dream session. Please wait.'
+      message: 'A video generation job is already queued or generating for this dream session. Please wait.'
     });
   }
 
-  // 2. GPU-level lock: Prevent multiple simultaneous GPU loads on 8GB VRAM
-  if (isGpuBusy) {
-    return res.status(429).json({
-      error: 'GPU_BUSY',
-      message: 'The local GPU is currently synthesizing another dream. Please wait a moment.'
-    });
-  }
-
-  // Look up approved keyframe strictly from server session
+  // 2. Validate selected keyframe strictly from server session
   const approvedKeyframe = session.keyframes.find(k => k.id === keyframeId);
   if (!approvedKeyframe) {
     return res.status(400).json({
@@ -463,82 +573,85 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     });
   }
 
-  if (demoUser.credits < 1) {
-    return res.status(402).json({ 
-      error: 'INSUFFICIENT_CREDITS', 
-      message: 'You have used all your dream credits. Recharge to manifest more dreams!' 
+  // 3. Credit Reservation Guard: Check available unreserved credits
+  const cost = 1;
+  const availableCredits = demoUser.credits - demoUser.reservedCredits;
+  if (availableCredits < cost) {
+    return res.status(402).json({
+      error: 'INSUFFICIENT_CREDITS',
+      message: 'Insufficient available dream credits. Credits are reserved for pending jobs in the queue.'
     });
   }
 
-  // Acquire locks
-  session.status = 'generating';
-  isGpuBusy = true;
+  // Atomically reserve credits at queue entry time (finalized on success, refunded on failure)
+  demoUser.reservedCredits += cost;
 
-  try {
-    // Generate video (persisted inside server storage and served through /api/media/videos/)
-    const video = await dreamProvider.generateVideo(
-      approvedKeyframe,
-      session.motionPrompt || session.refinedPrompt,
-      session.cameraMotion,
-      (prog) => emitDreamProgress(session.dreamId, prog)
-    );
+  const jobId = `job_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  session.status = 'queued';
+  session.activeJobId = jobId;
 
-    // Deduct credit ONLY upon verified success
-    demoUser.credits -= 1;
+  const { queuePosition } = await dreamQueue.addJob({
+    jobId,
+    dreamId,
+    userId: demoUser.id,
+    keyframeId,
+    dreamTitle: dreamTitle || 'Lucid Vision',
+    reservedCredits: cost,
+    enqueuedAt: Date.now()
+  });
 
-    const completedDream = {
-      id: session.dreamId,
-      title: dreamTitle || 'Untitled Vision',
-      keyframeUrl: approvedKeyframe.imageUrl,
-      video,
-      prompt: session.refinedPrompt,
-      createdAt: new Date().toISOString()
-    };
+  // Emit initial SSE QUEUED event
+  emitDreamProgress(dreamId, {
+    stage: 'QUEUED',
+    stageLabel: `In Queue (Position #${queuePosition})`,
+    detail: queuePosition === 1 ? 'Next up for rendering on GPU' : `${queuePosition - 1} job(s) ahead in queue`,
+    percent: 0,
+    elapsedSeconds: 0,
+    jobId,
+    queuePosition,
+    currentScene: 1,
+    totalScenes: session.scenes?.length || 1
+  });
 
-    session.video = video;
-    session.status = 'completed';
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
-    recentDreams.unshift(completedDream);
+  // Asynchronous Response: HTTP 202 Accepted
+  return res.status(202).json({
+    success: true,
+    jobId,
+    dreamId,
+    status: 'queued',
+    queuePosition,
+    reservedCredits: cost,
+    availableCredits: demoUser.credits - demoUser.reservedCredits,
+    message: 'Video generation job queued successfully'
+  });
+});
 
-    // Gracefully clean up SSE stream and cached progress event after client receives completion
-    setTimeout(() => {
-      progressEvents.delete(session.dreamId);
-      const clients = progressClients.get(session.dreamId);
-      if (clients) {
-        for (const client of clients) {
-          try { client.end(); } catch {}
-        }
-        progressClients.delete(session.dreamId);
-      }
-    }, 15_000).unref();
-
-    res.json({
-      success: true,
-      remainingCredits: demoUser.credits,
-      dream: completedDream
+// Step 4: Job Status & Polling Endpoint
+app.get('/api/dreams/jobs/:jobId', async (req, res) => {
+  const { jobId } = req.params;
+  const jobStatus = await dreamQueue.getJobStatus(jobId);
+  if (!jobStatus) {
+    return res.status(404).json({
+      error: 'JOB_NOT_FOUND',
+      message: `Job ${jobId} was not found.`
     });
-  } catch (error: any) {
-    console.error('Error generating video:', error);
-    session.status = 'failed';
-    // User credits were NOT deducted
-
-    // Clean up SSE stream on failure
-    setTimeout(() => {
-      progressEvents.delete(session.dreamId);
-      const clients = progressClients.get(session.dreamId);
-      if (clients) {
-        for (const client of clients) {
-          try { client.end(); } catch {}
-        }
-        progressClients.delete(session.dreamId);
-      }
-    }, 15_000).unref();
-
-    res.status(500).json({ error: 'FAILED_TO_GENERATE_VIDEO', message: error.message });
-  } finally {
-    // Release GPU lock unconditionally
-    isGpuBusy = false;
   }
+
+  const session = dreamSessions.get(jobStatus.dreamId);
+  const dream = (session?.status === 'completed' && session.video) ? {
+    id: session.dreamId,
+    title: 'Lucid Vision',
+    keyframeUrl: session.keyframes.find(k => k.id === session.video?.id)?.imageUrl || session.keyframes[0]?.imageUrl,
+    video: session.video,
+    prompt: session.refinedPrompt,
+    createdAt: new Date().toISOString()
+  } : undefined;
+
+  res.json({
+    success: true,
+    job: jobStatus,
+    dream
+  });
 });
 
 // Recent Dreams Gallery
@@ -546,8 +659,20 @@ app.get('/api/dreams/recent', (req, res) => {
   res.json({ dreams: recentDreams });
 });
 
-app.listen(Number(PORT), HOST, () => {
-  console.log(`✨ Dream Viewer Server active on http://${HOST}:${PORT}`);
-  console.log(`🔒 4-Layer Moderation Shield & Provider: ${dreamProvider.name} (isMock=${dreamProvider.isMock})`);
-  console.log(`📁 Media Storage: ${STORAGE_VIDEOS_DIR}`);
+// Strict Server Startup with Queue Initialization
+async function startServer() {
+  // Initialize Dream Queue (validates Redis if QUEUE_DRIVER=bullmq, or boots memory queue if QUEUE_DRIVER=memory)
+  dreamQueue = await createDreamQueue(processVideoJob);
+
+  app.listen(Number(PORT), HOST, () => {
+    console.log(`✨ Dream Viewer Server active on http://${HOST}:${PORT}`);
+    console.log(`🔒 4-Layer Moderation Shield & Provider: ${dreamProvider.name} (isMock=${dreamProvider.isMock})`);
+    console.log(`📦 Queue Driver: ${dreamQueue.driver} (Worker Concurrency: 1)`);
+    console.log(`📁 Media Storage: ${STORAGE_VIDEOS_DIR}`);
+  });
+}
+
+startServer().catch(err => {
+  console.error('[FATAL SERVER STARTUP ERROR]', err.message);
+  process.exit(1);
 });
