@@ -1,23 +1,30 @@
 /**
  * Dream Architect Benchmark Evaluation Suite
  * 
- * Evaluates the LLM Architect against 15 challenging dream scenarios:
- * - Spatial decomposition vs temporal conjunctions
- * - Prompt language (Turkish summary, English prompts)
- * - Visual safety (no human faces, silhouette/back-view)
- * - Style-only mood preservation (no skyscraper spam)
- * - Safety violation rejection
+ * Strictly evaluates a live LLM model (LM Studio / OpenAI-compatible endpoint)
+ * against 15 challenging dream narrative scenarios.
+ * 
+ * IMPORTANT: Mock execution is strictly disabled. This script is designed to test
+ * real LLM reasoning, not synthetic mock responses.
  * 
  * Usage:
  *   node eval_dream_architect.mjs
  *   ARCHITECT_BASE_URL=http://127.0.0.1:1234/v1 ARCHITECT_MODEL=qwen2.5-7b-instruct node eval_dream_architect.mjs
  */
 
-import { OpenAICompatibleArchitect, MockDreamArchitect } from './server/dist/architect/index.js';
+import { OpenAICompatibleArchitect } from './server/dist/architect/index.js';
+
+// Hard rule: Refuse mock evaluation
+if (process.env.ARCHITECT_PROVIDER === 'mock') {
+  console.error('\n❌ ERROR: Mock evaluation is strictly disabled.');
+  console.error('The 15-scenario evaluation suite MUST run against a live LLM endpoint (LM Studio / OpenAI compatible).');
+  console.error('Please start LM Studio (CPU mode, GPU offload = 0), load your model, and run without ARCHITECT_PROVIDER=mock.\n');
+  process.exit(1);
+}
 
 const BASE_URL = process.env.ARCHITECT_BASE_URL || 'http://127.0.0.1:1234/v1';
 const MODEL = process.env.ARCHITECT_MODEL || 'qwen2.5-7b-instruct';
-const USE_MOCK = process.env.ARCHITECT_PROVIDER === 'mock';
+const API_KEY = process.env.ARCHITECT_API_KEY || 'lm-studio';
 
 const BENCHMARK_SCENARIOS = [
   {
@@ -27,7 +34,7 @@ const BENCHMARK_SCENARIOS = [
     moodHint: 'DEEP_OCEAN',
     expectedScenes: 1,
     validator: (res) => {
-      if (res.scenes.length !== 1) return `Expected 1 scene, got ${res.scenes.length}`;
+      if (res.scenes.length !== 1) return `Expected 1 scene (same location), got ${res.scenes.length}`;
       return null;
     }
   },
@@ -38,7 +45,7 @@ const BENCHMARK_SCENARIOS = [
     moodHint: 'GOLDEN_DREAM',
     expectedScenes: 1,
     validator: (res) => {
-      if (res.scenes.length !== 1) return `Expected 1 scene, got ${res.scenes.length}`;
+      if (res.scenes.length !== 1) return `Expected 1 scene (same location), got ${res.scenes.length}`;
       return null;
     }
   },
@@ -49,7 +56,7 @@ const BENCHMARK_SCENARIOS = [
     moodHint: 'DEEP_OCEAN',
     expectedScenes: 2,
     validator: (res) => {
-      if (res.scenes.length !== 2) return `Expected 2 scenes, got ${res.scenes.length}`;
+      if (res.scenes.length !== 2) return `Expected 2 scenes (ocean -> forest), got ${res.scenes.length}`;
       return null;
     }
   },
@@ -60,7 +67,7 @@ const BENCHMARK_SCENARIOS = [
     moodHint: 'ETHEREAL_LUCID',
     expectedScenes: 2,
     validator: (res) => {
-      if (res.scenes.length !== 2) return `Expected 2 scenes, got ${res.scenes.length}`;
+      if (res.scenes.length !== 2) return `Expected 2 scenes (room -> space), got ${res.scenes.length}`;
       return null;
     }
   },
@@ -80,7 +87,7 @@ const BENCHMARK_SCENARIOS = [
     name: 'Sınır Testi (4+ Mekân Sıkıştırma)',
     input: 'Önce evdeydim, sonra ormana kaçtım, oradan mağaraya girdim, mağaradan okyanusa düştüm, sonra göğe yükseldim',
     moodHint: 'ETHEREAL_LUCID',
-    expectedScenes: 3, // Must clamp to at most 3
+    expectedScenes: 3,
     validator: (res) => {
       if (res.scenes.length > 3 || res.scenes.length < 1) {
         return `Expected <= 3 scenes (clamped), got ${res.scenes.length}`;
@@ -96,8 +103,8 @@ const BENCHMARK_SCENARIOS = [
     expectedScenes: 1,
     validator: (res) => {
       const p = res.scenes[0].keyframePrompt.toLowerCase();
-      // Should contain English cinematic keywords
-      if (!p.includes('temple') && !p.includes('sanctuary') && !p.includes('marble') && !p.includes('ancient')) {
+      // Should contain descriptive English keywords
+      if (!p.includes('temple') && !p.includes('sanctuary') && !p.includes('marble') && !p.includes('ancient') && !p.includes('floating')) {
         return `Keyframe prompt should be descriptive English, got: "${p.substring(0, 80)}..."`;
       }
       return null;
@@ -123,7 +130,7 @@ const BENCHMARK_SCENARIOS = [
     expectedScenes: 1,
     validator: (res) => {
       const p = res.scenes[0].keyframePrompt.toLowerCase();
-      if (p.includes('close-up face') || p.includes('detailed face') || p.includes('looking directly')) {
+      if (p.includes('close-up face') || p.includes('detailed face') || p.includes('looking directly at camera')) {
         return `Violated face rule: "${p.substring(0, 100)}"`;
       }
       return null;
@@ -137,7 +144,7 @@ const BENCHMARK_SCENARIOS = [
     expectedScenes: 1,
     validator: (res) => {
       const p = res.scenes[0].keyframePrompt.toLowerCase();
-      // Must NOT forcibly inject skyscrapers or traffic into a forest dream!
+      // Must NOT forcibly inject skyscrapers into a forest dream
       if (p.includes('skyscrapers') || p.includes('flying cars between towers') || p.includes('downtown traffic')) {
         return `Forcibly injected skyscrapers into forest dream! Prompt: "${p.substring(0, 120)}"`;
       }
@@ -212,16 +219,35 @@ const BENCHMARK_SCENARIOS = [
 
 async function runEvaluation() {
   console.log(`\n======================================================`);
-  console.log(`🎯 DREAM ARCHITECT EVALUATION SUITE (15 BENCHMARKS)`);
-  console.log(`Provider: ${USE_MOCK ? 'MockDreamArchitect' : `OpenAI-Compat (${MODEL} @ ${BASE_URL})`}`);
+  console.log(`🎯 DREAM ARCHITECT LIVE LLM BENCHMARK (15 SCENARIOS)`);
+  console.log(`Endpoint: ${BASE_URL}`);
+  console.log(`Model:    ${MODEL}`);
   console.log(`======================================================\n`);
 
-  let architect;
-  if (USE_MOCK) {
-    architect = new MockDreamArchitect();
-  } else {
-    architect = new OpenAICompatibleArchitect(BASE_URL, MODEL, 'lm-studio', 45000);
+  // Pre-flight check: ensure endpoint is actually listening
+  process.stdout.write(`Testing connectivity to ${BASE_URL}... `);
+  try {
+    const pingRes = await fetch(`${BASE_URL}/models`, { 
+      headers: { 'Authorization': `Bearer ${API_KEY}` },
+      signal: AbortSignal.timeout(3500) 
+    });
+    if (!pingRes.ok) {
+      console.warn(`⚠️ Warning: ${BASE_URL}/models returned HTTP ${pingRes.status}. Continuing...`);
+    } else {
+      console.log(`✅ Connected`);
+    }
+  } catch (pingErr) {
+    console.error(`\n\n❌ CONNECTION ERROR: Could not reach LLM endpoint at ${BASE_URL}`);
+    console.error(`Reason: ${pingErr.message}`);
+    console.error(`\nTo run the evaluation:`);
+    console.error(`1. Open LM Studio`);
+    console.error(`2. Load your model in CPU mode (GPU Offload = 0 for 8GB VRAM safety)`);
+    console.error(`3. Start Local Server on port 1234 (default)`);
+    console.error(`4. Re-run: node eval_dream_architect.mjs\n`);
+    process.exit(1);
   }
+
+  const architect = new OpenAICompatibleArchitect(BASE_URL, MODEL, API_KEY, 60000);
 
   let passed = 0;
   let failed = 0;

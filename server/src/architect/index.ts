@@ -36,11 +36,16 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
     this.timeoutMs = timeoutMs;
   }
 
+  /**
+   * Safe string cleaning: removes unprintable control characters and normalizes whitespace.
+   * Does NOT strip quotes, brackets, or legitimate user dream vocabulary.
+   * Injection defense is enforced by XML bounding (<user_dream_input>) and post-LLM moderation audits.
+   */
   private sanitizeInput(text: string): string {
     return text
-      .replace(/[\r\n\t]+/g, ' ')
-      .replace(/[\\"{}[\]]/g, '')
-      .replace(/\b(system prompt|ignore previous instructions|disregard guidelines|you are now|jailbreak)\b/gi, '')
+      .slice(0, 2000)
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
   }
 
@@ -83,7 +88,8 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${this.apiKey}`
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
+            signal: controller.signal // Signal attached to prevent hanging indefinitely
           });
         }
       }
@@ -126,39 +132,50 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
     ];
 
     console.log(`🧠 [DreamArchitect] Invoking LLM (${this.model} at ${this.baseUrl}) to analyze dream scenes...`);
-    const rawOutput = await this.callLlm(messages);
+    let currentOutput = await this.callLlm(messages);
 
-    // Parse and validate with Zod
+    // 1. JSON Parse validation with single retry
     let parsedJson: any;
     try {
-      parsedJson = JSON.parse(rawOutput);
+      parsedJson = JSON.parse(currentOutput);
     } catch (parseErr: any) {
       console.warn(`[DreamArchitect] LLM output was not valid JSON. Attempting single retry with correction...`);
       const retryMessages = [
         ...messages,
-        { role: 'assistant', content: rawOutput },
+        { role: 'assistant', content: currentOutput },
         { role: 'user', content: `Error: Your output was not valid JSON (${parseErr.message}). Output strictly valid JSON conforming to the schema.` }
       ];
-      const retryOutput = await this.callLlm(retryMessages);
-      parsedJson = JSON.parse(retryOutput);
+      currentOutput = await this.callLlm(retryMessages);
+      try {
+        parsedJson = JSON.parse(currentOutput);
+      } catch (secondParseErr: any) {
+        throw new Error(`LLM Architect output was not valid JSON after retry: ${secondParseErr.message}. Raw output: ${currentOutput.substring(0, 300)}`);
+      }
     }
 
+    // 2. Zod Schema validation with single retry
     const zodResult = DreamArchitectResponseSchema.safeParse(parsedJson);
     if (!zodResult.success) {
       console.warn(`[DreamArchitect] Zod validation failed: ${zodResult.error.message}. Attempting single correction retry with LLM...`);
       const retryMessages = [
         ...messages,
-        { role: 'assistant', content: rawOutput },
+        { role: 'assistant', content: currentOutput }, // Uses the latest actual assistant message
         { 
           role: 'user', 
           content: `Your previous JSON failed schema validation with errors: ${JSON.stringify(zodResult.error.issues)}. Please fix and output strictly valid JSON with 1 to 3 scenes matching the schema.` 
         }
       ];
-      const retryOutput = await this.callLlm(retryMessages);
-      const retryParsed = JSON.parse(retryOutput);
+      currentOutput = await this.callLlm(retryMessages);
+      let retryParsed: any;
+      try {
+        retryParsed = JSON.parse(currentOutput);
+      } catch (zodRetryParseErr: any) {
+        throw new Error(`LLM Architect output was not valid JSON during schema correction retry: ${zodRetryParseErr.message}`);
+      }
+
       const retryZod = DreamArchitectResponseSchema.safeParse(retryParsed);
       if (!retryZod.success) {
-        throw new Error(`LLM Architect output failed strict Zod schema validation: ${retryZod.error.message}`);
+        throw new Error(`LLM Architect output failed strict Zod schema validation after correction retry: ${retryZod.error.message}`);
       }
       return retryZod.data as DreamArchitectResponse;
     }
@@ -168,7 +185,8 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
 }
 
 /**
- * Deterministic Mock Architect for CI, automated testing, and offline execution
+ * Generic Deterministic Mock Architect for CI pipelines and offline testing.
+ * Strictly used to verify pipeline execution, Zod validation, and error boundaries.
  */
 export class MockDreamArchitect implements IDreamArchitect {
   public name = 'MockDreamArchitect (Deterministic Offline Test Engine)';
@@ -178,7 +196,7 @@ export class MockDreamArchitect implements IDreamArchitect {
     await new Promise(r => setTimeout(r, 20));
     const lower = rawText.toLowerCase();
 
-    // 1. Safety check (Unicode-aware boundary without ASCII \b limitation)
+    // 1. Safety check (Unicode boundary safe)
     if (/(?:^|\s|[.,!?;:])(çıplak|ciplak|nude|naked|erotic|gore|porn|behead)(?:$|\s|[.,!?;:])/i.test(lower)) {
       return {
         safety: {
@@ -191,127 +209,44 @@ export class MockDreamArchitect implements IDreamArchitect {
 
     const defaultMood = moodHint || 'ETHEREAL_LUCID';
 
-    // 2. Spatial multi-scene heuristics for deterministic testing
-    const hasForestTransition = lower.includes('orman') || lower.includes('forest');
-    const hasOcean = lower.includes('deniz') || lower.includes('ocean') || lower.includes('su') || lower.includes('göl');
-    const hasSkyOrFlight = lower.includes('gökyüzü') || lower.includes('sky') || lower.includes('uç') || lower.includes('bulut');
-    const hasCityOrNeon = lower.includes('neon') || lower.includes('şehir') || lower.includes('city') || lower.includes('oda') || lower.includes('room');
-    const hasSpaceOrCosmic = lower.includes('uzay') || lower.includes('space') || lower.includes('kozmik');
-    const hasCave = lower.includes('mağara') || lower.includes('cave');
+    // 2. Generic multi-scene test detection for CI (Ocean -> Forest)
+    const hasOcean = lower.includes('deniz') || lower.includes('ocean');
+    const hasForest = lower.includes('orman') || lower.includes('forest');
 
-    // Scenario A: 3 distinct environments (Oda -> Karlı Dağ -> Bulutlar, or Ev -> Orman -> Mağara)
-    if ((hasCityOrNeon && hasForestTransition && hasSkyOrFlight) || 
-        (lower.includes('karlı bir dağ') || lower.includes('karlı dağ')) ||
-        (hasOcean && hasCave && hasSkyOrFlight) ||
-        lower.includes('mağaradan okyanusa')) {
+    if (hasOcean && hasForest) {
       return {
         safety: { allowed: true, category: null },
         scenes: [
           {
             sceneNumber: 1,
-            summary: 'Karanlık Başlangıç Mekânı',
-            mood: 'ETHEREAL_LUCID',
-            keyframePrompt: 'A mysterious dimly lit room with ancient stone arches, soft atmospheric twilight beaming through tall windows, lone traveler seen from behind, cinematic 8k detail.',
-            motionPrompt: 'Slow contemplative camera push towards the glowing doorway, subtle atmospheric dust particles drifting smoothly, 24fps.',
-            cameraMotion: 'Slow forward dolly tracking push'
+            summary: 'Derin Sularda Yüzüş',
+            mood: 'DEEP_OCEAN',
+            keyframePrompt: 'Submerged view of an oceanic abyss with caustic sunbeams dancing through azure waters, cinematic scale, high clarity.',
+            motionPrompt: 'Slow forward camera push through the water, floating particles drifting gently, smooth 24fps motion.',
+            cameraMotion: 'Submerged fluid forward drift'
           },
           {
             sceneNumber: 2,
-            summary: 'Karlı Dağ Zirvesi',
-            mood: 'FLOATING_SKY',
-            keyframePrompt: 'Panoramic view of a jagged snow-covered alpine peak under crisp crystal daylight, sweeping icy precipice, cinematic scale, high contrast clarity.',
-            motionPrompt: 'Majestic sweeping aerial glide over the snowy ridge, blowing snow powder dancing in the wind, continuous smooth 24fps motion.',
-            cameraMotion: 'Sweeping wide aerial forward glide'
-          },
-          {
-            sceneNumber: 3,
-            summary: 'Bulutların Arasında Uçuş',
-            mood: 'FLOATING_SKY',
-            keyframePrompt: 'High altitude dreamscape floating effortlessly above a vast expanse of golden sunrise clouds, infinite horizon, ethereal radiant sunbeams, pristine cinematic beauty.',
-            motionPrompt: 'Weightless soaring forward drift through soft cloud mist, shifting radiant sunlight, smooth hypnotic motion.',
-            cameraMotion: 'Smooth weightless forward aerial glide'
+            summary: 'Sisli Çam Ormanına Geçiş',
+            mood: 'NOSTALGIC_FOG',
+            keyframePrompt: 'Dense pine forest shrouded in atmospheric morning mist, soft dawn glow through trees, mossy earth, cinematic depth.',
+            motionPrompt: 'Slow steady camera tracking push along a misty forest path, calm ambient motion, 24fps.',
+            cameraMotion: 'Slow forward tracking push'
           }
         ]
       };
     }
 
-    // Scenario B: 2 distinct environments (e.g. Ocean -> Forest or Room -> Space)
-    if ((hasOcean && hasForestTransition) || (hasCityOrNeon && hasSpaceOrCosmic)) {
-      return {
-        safety: { allowed: true, category: null },
-        scenes: [
-          {
-            sceneNumber: 1,
-            summary: hasSpaceOrCosmic ? 'Eski Ahşap Oda' : 'Derin Sularda Yüzüş',
-            mood: hasSpaceOrCosmic ? 'NOSTALGIC_FOG' : 'DEEP_OCEAN',
-            keyframePrompt: hasSpaceOrCosmic
-              ? 'Vintage rustic library room with warm candlelit wooden bookshelves, dust motes dancing in sunbeams, cloaked figure seated with back turned, 35mm film aesthetic.'
-              : 'Submerged deep aquatic abyss with shimmering caustic light patterns dancing across turquoise waters, distant majestic sea spires, pristine underwater clarity, photorealistic.',
-            motionPrompt: hasSpaceOrCosmic
-              ? 'Slow steady dolly push towards an open mysterious door, gentle ambient dust particles, warm lighting.'
-              : 'Slow submerged forward drift through crystal water, floating luminescent plankton swirling smoothly, continuous 24fps motion.',
-            cameraMotion: 'Slow forward dolly tracking push'
-          },
-          {
-            sceneNumber: 2,
-            summary: hasSpaceOrCosmic ? 'Yerçekimsiz Uzay Boşluğu' : 'Sisli Çam Ormanına Geçiş',
-            mood: hasSpaceOrCosmic ? 'ETHEREAL_LUCID' : 'NOSTALGIC_FOG',
-            keyframePrompt: hasSpaceOrCosmic
-              ? 'Weightless cosmic expanse with luminous stardust nebulas in deep indigo and violet, distant glowing celestial spheres, pristine infinite horizon, photorealistic scale.'
-              : 'Atmospheric ancient pine forest shrouded in dense rolling morning mist, soft golden dawn light filtering through towering trees, mossy forest floor, evocative dream aesthetic.',
-            motionPrompt: hasSpaceOrCosmic
-              ? 'Weightless forward drift through glowing cosmic dust motes, subtle shifting stellar illumination, serene calm movement, 24fps.'
-              : 'Slow steady dolly glide forward along a mossy woodland trail, soft mist swirling gently between tree trunks, serene cinematic movement.',
-            cameraMotion: 'Slow forward tracking glide'
-          }
-        ]
-      };
-    }
-
-    // Scenario C: English prompt generation test
-    if (lower.includes('tapınak') || lower.includes('temple')) {
-      return {
-        safety: { allowed: true, category: null },
-        scenes: [
-          {
-            sceneNumber: 1,
-            summary: 'Süzülen Antik Mermer Tapınak',
-            mood: defaultMood,
-            keyframePrompt: 'Colossal ancient marble sanctuary floating weightlessly through cosmic twilight stardust, surrounded by concentric slowly orbiting rings of golden celestial light, pristine cinematic 8k detail.',
-            motionPrompt: 'Slow cinematic forward dolly push towards the floating sanctuary, radiant starlight particles shimmering, smooth 24fps motion.',
-            cameraMotion: 'Slow forward dolly tracking push'
-          }
-        ]
-      };
-    }
-
-    // Scenario D: Cyberpunk style-only test (e.g. neon glowing forest - must NOT force skyscrapers!)
-    if (lower.includes('cyberpunk') || defaultMood === 'SURREAL_CYBERPUNK') {
-      return {
-        safety: { allowed: true, category: null },
-        scenes: [
-          {
-            sceneNumber: 1,
-            summary: 'Sibernetik Neon Rüya',
-            mood: 'SURREAL_CYBERPUNK',
-            keyframePrompt: `${rawText}. Cyberpunk aesthetic, intense high-contrast cinematic lighting, vibrant neon color grading with electric cyan and magenta accents, sharp geometric clarity, polished wet surfaces with clean glossy reflections, photorealistic detail.`,
-            motionPrompt: `Smooth fluid tracking camera push through the scene: ${rawText}. Ambient neon illumination pulsing softly, light rain drifting smoothly, continuous 24fps motion.`,
-            cameraMotion: 'Smooth forward tracking push with dynamic low-angle glide'
-          }
-        ]
-      };
-    }
-
-    // Scenario D: Default Single Scene (Even if "sonra", "dalgalar büyüdü", etc.)
+    // Default Single Scene for CI
     return {
       safety: { allowed: true, category: null },
       scenes: [
         {
           sceneNumber: 1,
-          summary: rawText.length > 30 ? rawText.substring(0, 30) + '...' : rawText,
+          summary: rawText.length > 40 ? rawText.substring(0, 40) + '...' : rawText,
           mood: defaultMood,
-          keyframePrompt: `${rawText}. Cinematic composition, crisp focal clarity, evocative dreamlike atmosphere, soft atmospheric illumination, fine detail, masterwork.`,
-          motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${rawText}. Subtle environmental motion, continuous smooth 24fps cinematic movement.`,
+          keyframePrompt: `${rawText}. Cinematic composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
+          motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${rawText}. Smooth continuous 24fps camera motion.`,
           cameraMotion: 'Slow forward tracking push with gentle weightless float'
         }
       ]

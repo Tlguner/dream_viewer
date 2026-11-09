@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { CheckCircle2, Video, RefreshCw, Camera, Sparkles, ShieldCheck, Eye, ArrowLeft, Info } from 'lucide-react';
+import { CheckCircle2, Video, RefreshCw, Camera, Sparkles, ShieldCheck, Eye, ArrowLeft, Info, Film } from 'lucide-react';
 
 interface Keyframe {
   id: string;
@@ -10,6 +10,15 @@ interface Keyframe {
   isSelected?: boolean;
 }
 
+export interface DreamScene {
+  sceneNumber: number;
+  summary: string;
+  mood: string;
+  keyframePrompt: string;
+  motionPrompt: string;
+  cameraMotion: string;
+}
+
 interface AnalysisData {
   refinedPrompt: string;
   keyframePrompt?: string;
@@ -17,6 +26,8 @@ interface AnalysisData {
   negativePrompt: string;
   cameraMotion: string;
   detectedMood: string;
+  scenes?: DreamScene[];
+  totalEstimatedSeconds?: number;
   visualElements: {
     setting: string;
     surrealTwist: string;
@@ -81,6 +92,49 @@ export const KeyframeReviewStep: React.FC<KeyframeReviewStepProps> = ({
           <span>
             <strong>Curated Composition Anchors:</strong> Preview keyframes are artistic anchors. When you approve a frame, its image will be directly uploaded to Wan 2.2 on your GPU for Image-to-Video synthesis.
           </span>
+        </div>
+      )}
+
+      {/* Multi-Scene Detected Storyboard Transparency Banner */}
+      {analysis.scenes && analysis.scenes.length > 1 && (
+        <div className="mb-6 p-4 rounded-2xl bg-gradient-to-r from-purple-950/40 via-indigo-950/40 to-slate-900/60 border border-purple-500/40 shadow-lg">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <Film className="w-4 h-4 text-purple-400" />
+              <span className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                Çoklu Sahne Algılandı ({analysis.scenes.length} Sahne)
+              </span>
+            </div>
+            <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+              Aşama 3 Önizlemesi
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 mb-2.5">
+            {analysis.scenes.map((scene) => (
+              <div 
+                key={scene.sceneNumber} 
+                className={`p-2.5 rounded-xl border text-xs transition-all ${
+                  scene.sceneNumber === 1 
+                    ? 'bg-purple-900/30 border-purple-400/50 text-purple-100 ring-1 ring-purple-500/30' 
+                    : 'bg-slate-900/50 border-slate-800 text-slate-400 opacity-80'
+                }`}
+              >
+                <div className="flex items-center justify-between font-semibold mb-1">
+                  <span>Sahne {scene.sceneNumber}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">{scene.mood}</span>
+                </div>
+                <p className="text-[11px] line-clamp-1">{scene.summary}</p>
+                {scene.sceneNumber === 1 && (
+                  <span className="inline-block mt-1 text-[10px] text-cyan-400 font-medium">● Şu an üretilen sahne</span>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            ℹ️ Çoklu sahne video birleştirme (multi-clip stitching) Aşama 3'te aktif olacaktır. Şu an sistem <strong>1. Sahne</strong> için keyframe ve video üretmektedir.
+          </p>
         </div>
       )}
 
