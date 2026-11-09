@@ -206,6 +206,15 @@ export class MockDreamProvider implements IDreamProvider {
     _cameraMotion: string,
     onProgress?: ProgressCallback
   ): Promise<DreamVideoResult> {
+    // Failure simulation trigger for multi-scene partial failure & credit refund testing
+    if (
+      _motionPrompt?.toLowerCase().includes('fail_scene') || 
+      _motionPrompt?.toLowerCase().includes('error_trigger') ||
+      _selectedKeyframe?.id?.toLowerCase().includes('fail_scene')
+    ) {
+      throw new Error('Simulated GPU synthesis failure on scene');
+    }
+
     onProgress?.({
       stage: 'INITIALIZING',
       stageLabel: 'Initializing Video Pipeline',

@@ -13,6 +13,8 @@ export interface ModerationResult {
   sanitizedPrompt?: string;
 }
 
+export type SceneStatus = 'pending' | 'keyframes_queued' | 'keyframes_ready' | 'video_queued' | 'rendering' | 'completed' | 'failed';
+
 export interface DreamScenePlan {
   sceneNumber: number;
   summary: string;
@@ -20,6 +22,12 @@ export interface DreamScenePlan {
   keyframePrompt: string;
   motionPrompt: string;
   cameraMotion: string;
+  status?: SceneStatus;
+  keyframes?: KeyframeOption[];
+  selectedKeyframeId?: string;
+  video?: DreamVideoResult;
+  error?: string;
+  activeJobId?: string;
 }
 
 export interface DreamArchitectResponse {
@@ -66,6 +74,7 @@ export interface DreamVideoResult {
   audioMood: string;
   shaderPreset: 'dream_haze' | 'retro_vhs' | 'lucid_glow' | 'spider_verse_halftone';
   isMock: boolean;
+  isStitched?: boolean;
 }
 
 export interface DreamSession {
@@ -89,7 +98,7 @@ export interface DreamSession {
 }
 
 export interface DreamProgressEvent {
-  stage: 'QUEUED' | 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'COMPLETED' | 'ERROR';
+  stage: 'QUEUED' | 'INITIALIZING' | 'DIFFUSION' | 'DECODING' | 'SAVING' | 'STITCHING' | 'COMPLETED' | 'ERROR';
   stageLabel: string;
   detail: string;
   percent: number;           // 0 to 100
@@ -102,7 +111,7 @@ export interface DreamProgressEvent {
   queuePosition?: number;
   currentScene?: number;
   totalScenes?: number;
-  result?: DreamVideoResult;
+  result?: DreamVideoResult | KeyframeOption[];
 }
 
 export type ProgressCallback = (progress: DreamProgressEvent) => void;
@@ -115,6 +124,7 @@ export interface KeyframeJobData {
   jobType: 'KEYFRAMES';
   jobId: string;
   dreamId: string;
+  sceneNumber: number;
   prompt: string;
   count: number;
   enqueuedAt: number;
@@ -124,6 +134,7 @@ export interface VideoJobData {
   jobType: 'VIDEO';
   jobId: string;
   dreamId: string;
+  sceneNumber: number;
   userId: string;
   keyframeId: string;
   dreamTitle?: string;
@@ -137,6 +148,7 @@ export interface GpuJobStatusResponse {
   jobId: string;
   dreamId: string;
   jobType: GpuJobType;
+  sceneNumber?: number;
   status: 'queued' | 'rendering' | 'completed' | 'failed';
   queuePosition: number;
   progress: number;

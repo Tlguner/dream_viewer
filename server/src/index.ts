@@ -12,6 +12,7 @@ import { ComfyDreamProvider } from './providers/comfy_provider.js';
 import { IDreamArchitect, OpenAICompatibleArchitect, MockDreamArchitect } from './architect/index.js';
 import { MoodStyle, IDreamProvider, DreamSession, DreamProgressEvent, GpuJobData, KeyframeJobData, VideoJobData, DreamVideoResult, KeyframeOption } from './types/index.js';
 import { createDreamQueue, IDreamQueue } from './queue/dream_queue.js';
+import { stitchSceneVideos } from './media/stitcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -191,12 +192,19 @@ const AnalyzeDreamSchema = z.object({
 
 const KeyframesSchema = z.object({
   dreamId: z.string().min(1, 'dreamId is required'),
+  sceneNumber: z.number().int().min(1).max(3).optional().default(1),
   count: z.number().int().min(1).max(6).default(3)
 });
 
 const GenerateVideoSchema = z.object({
   dreamId: z.string().min(1, 'dreamId is required'),
+  sceneNumber: z.number().int().min(1).max(3).optional().default(1),
   keyframeId: z.string().min(1, 'keyframeId is required'),
+  dreamTitle: z.string().max(100).optional()
+});
+
+const GenerateScenesSchema = z.object({
+  dreamId: z.string().min(1, 'dreamId is required'),
   dreamTitle: z.string().max(100).optional()
 });
 
@@ -357,7 +365,11 @@ app.post('/api/dreams/analyze', async (req, res) => {
       negativePrompt: analysis.negativePrompt,
       cameraMotion: analysis.cameraMotion,
       mood: analysis.detectedMood,
-      scenes: analysis.scenes,
+      scenes: analysis.scenes.map(s => ({
+        ...s,
+        status: 'pending' as const,
+        keyframes: []
+      })),
       totalEstimatedSeconds: analysis.totalEstimatedSeconds,
       keyframes: [],
       status: 'analyzed',
@@ -378,8 +390,15 @@ app.post('/api/dreams/analyze', async (req, res) => {
   }
 });
 
-// Step 2: Generate Keyframe Previews (Server session locked + GPU concurrency lock)
-// Step 2: Generate Keyframe Previews (Server session locked + GPU queue concurrency guard)
+// Helper to map videoUrl to local filesystem path
+function getLocalVideoPath(videoUrl: string): string {
+  const filename = path.basename(videoUrl);
+  return path.join(STORAGE_VIDEOS_DIR, filename);
+}
+
+const WAN_TRANSITION_SECONDS = parseFloat(process.env.WAN_TRANSITION_SECONDS || '0.3');
+
+// Step 2: Generate Keyframe Previews (Asynchronous Queue Architecture - Returns 202 Accepted)
 app.post('/api/dreams/keyframes', async (req, res) => {
   try {
     const parseResult = KeyframesSchema.safeParse(req.body);
@@ -390,7 +409,7 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       });
     }
 
-    const { dreamId, count } = parseResult.data;
+    const { dreamId, sceneNumber, count } = parseResult.data;
     const session = dreamSessions.get(dreamId);
     if (!session) {
       return res.status(404).json({
@@ -399,11 +418,19 @@ app.post('/api/dreams/keyframes', async (req, res) => {
       });
     }
 
-    // Session duplicate lock: Prevent overlapping generation on the same session
-    if (session.status === 'generating' || session.status === 'queued') {
+    const targetScene = session.scenes.find(s => s.sceneNumber === sceneNumber) || session.scenes[0];
+    if (!targetScene) {
+      return res.status(404).json({
+        error: 'SCENE_NOT_FOUND',
+        message: `Scene #${sceneNumber} not found in this dream session.`
+      });
+    }
+
+    // Per-scene lock: Prevent concurrent keyframe requests on the same scene
+    if (targetScene.status === 'keyframes_queued' || targetScene.status === 'rendering') {
       return res.status(409).json({
         error: 'GENERATION_IN_PROGRESS',
-        message: 'A generation job is already active or queued for this dream session. Please wait.'
+        message: `Keyframe generation is already queued or generating for Scene #${targetScene.sceneNumber}. Please wait.`
       });
     }
 
@@ -411,39 +438,44 @@ app.post('/api/dreams/keyframes', async (req, res) => {
     session.expiresAt = Date.now() + SESSION_TTL_MS;
 
     const jobId = `kf_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
-    session.status = 'queued';
-    session.activeJobId = jobId;
+    targetScene.status = 'keyframes_queued';
+    targetScene.activeJobId = jobId;
 
     // Enqueue keyframe generation into unified GPU queue (strictly concurrency: 1 with videos)
     const { queuePosition } = await dreamQueue.addJob({
       jobType: 'KEYFRAMES',
       jobId,
       dreamId,
-      prompt: session.keyframePrompt || session.refinedPrompt,
+      sceneNumber: targetScene.sceneNumber,
+      prompt: targetScene.keyframePrompt || session.refinedPrompt,
       count,
       enqueuedAt: Date.now()
     });
 
     emitDreamProgress(dreamId, {
       stage: 'QUEUED',
-      stageLabel: `Keyframes Queued (Position #${queuePosition})`,
+      stageLabel: `Keyframes Queued for Scene #${targetScene.sceneNumber} (Position #${queuePosition})`,
       detail: queuePosition === 1 ? 'Next up on GPU' : `${queuePosition - 1} job(s) ahead in GPU queue`,
       percent: 0,
       elapsedSeconds: 0,
       jobId,
-      queuePosition
+      queuePosition,
+      currentScene: targetScene.sceneNumber,
+      totalScenes: session.scenes.length
     });
 
-    // Wait for the keyframe job to be processed by the single GPU worker
-    const keyframes = await dreamQueue.waitForJobResult<KeyframeOption[]>(jobId);
-
-    res.json({
+    // Asynchronous Response: HTTP 202 Accepted (No open HTTP holding!)
+    return res.status(202).json({
       success: true,
+      jobId,
       dreamId,
-      keyframes
+      sceneNumber: targetScene.sceneNumber,
+      status: 'queued',
+      queuePosition,
+      message: `Keyframe generation job for Scene #${targetScene.sceneNumber} queued successfully`
     });
   } catch (error: any) {
-    console.error('Error generating keyframes:', error);
+    console.error('Error queueing keyframes:', error);
     res.status(500).json({ error: 'FAILED_TO_GENERATE_KEYFRAMES', message: error.message });
   }
 });
@@ -455,7 +487,9 @@ async function processKeyframesJob(jobData: KeyframeJobData, updateJobProgress: 
     throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
   }
 
-  session.status = 'generating';
+  const targetScene = session.scenes.find(s => s.sceneNumber === jobData.sceneNumber) || session.scenes[0];
+  targetScene.status = 'rendering';
+
   try {
     const keyframes = await dreamProvider.generateKeyframes(
       jobData.prompt,
@@ -464,27 +498,52 @@ async function processKeyframesJob(jobData: KeyframeJobData, updateJobProgress: 
         const enrichedProg: DreamProgressEvent = {
           ...prog,
           jobId: jobData.jobId,
-          queuePosition: 0
+          queuePosition: 0,
+          currentScene: targetScene.sceneNumber,
+          totalScenes: session.scenes.length
         };
         emitDreamProgress(session.dreamId, enrichedProg);
         updateJobProgress(enrichedProg);
       }
     );
 
-    session.keyframes = keyframes;
-    session.status = 'keyframes_ready';
+    targetScene.keyframes = keyframes;
+    targetScene.status = 'keyframes_ready';
+    targetScene.selectedKeyframeId = keyframes[0]?.id;
     session.expiresAt = Date.now() + SESSION_TTL_MS;
+
+    // For backwards compatibility with single-scene flow
+    if (targetScene.sceneNumber === 1) {
+      session.keyframes = keyframes;
+      session.status = 'keyframes_ready';
+    }
+
+    emitDreamProgress(session.dreamId, {
+      stage: 'COMPLETED',
+      stageLabel: `Keyframes Ready for Scene #${targetScene.sceneNumber}`,
+      detail: `${keyframes.length} anchor visions loaded`,
+      percent: 100,
+      elapsedSeconds: 0,
+      jobId: jobData.jobId,
+      queuePosition: 0,
+      currentScene: targetScene.sceneNumber,
+      totalScenes: session.scenes.length,
+      result: keyframes
+    });
 
     return keyframes;
   } catch (err: any) {
-    session.status = 'analyzed'; // Revert back to analyzed on error so user can retry
+    targetScene.status = 'failed';
+    targetScene.error = err.message;
     emitDreamProgress(session.dreamId, {
       stage: 'ERROR',
-      stageLabel: 'Keyframe Synthesis Failed',
+      stageLabel: `Keyframe Synthesis Failed for Scene #${targetScene.sceneNumber}`,
       detail: err.message,
       percent: 0,
       elapsedSeconds: 0,
-      jobId: jobData.jobId
+      jobId: jobData.jobId,
+      currentScene: targetScene.sceneNumber,
+      totalScenes: session.scenes.length
     });
     throw err;
   }
@@ -499,75 +558,169 @@ async function processVideoJob(jobData: VideoJobData, updateJobProgress: (prog: 
     throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
   }
 
-  const approvedKeyframe = session.keyframes.find(k => k.id === jobData.keyframeId);
+  const targetScene = session.scenes.find(s => s.sceneNumber === jobData.sceneNumber) || session.scenes[0];
+  const approvedKeyframe = targetScene?.keyframes?.find(k => k.id === jobData.keyframeId) ||
+    session.keyframes.find(k => k.id === jobData.keyframeId);
+
   if (!approvedKeyframe) {
     demoUser.reservedCredits = Math.max(0, demoUser.reservedCredits - jobData.reservedCredits);
-    throw new Error(`Approved keyframe ${jobData.keyframeId} not found in session.`);
+    throw new Error(`Approved keyframe ${jobData.keyframeId} not found in Scene #${targetScene.sceneNumber}.`);
   }
 
-  session.status = 'generating';
+  targetScene.status = 'rendering';
 
   try {
     const video = await dreamProvider.generateVideo(
       approvedKeyframe,
-      session.motionPrompt || session.refinedPrompt,
-      session.cameraMotion,
+      targetScene.motionPrompt || session.refinedPrompt,
+      targetScene.cameraMotion,
       (prog) => {
         const enrichedProg: DreamProgressEvent = {
           ...prog,
           jobId: jobData.jobId,
           queuePosition: 0,
-          currentScene: 1,
-          totalScenes: session.scenes?.length || 1
+          currentScene: targetScene.sceneNumber,
+          totalScenes: session.scenes.length
         };
         emitDreamProgress(session.dreamId, enrichedProg);
         updateJobProgress(enrichedProg);
       }
     );
 
-    // Finalize credit deduction ONLY upon verified successful synthesis
+    // Finalize credit deduction ONLY upon verified successful synthesis of this scene
     demoUser.credits -= jobData.reservedCredits;
     demoUser.reservedCredits -= jobData.reservedCredits;
 
-    const completedDream = {
-      id: session.dreamId,
-      title: jobData.dreamTitle || 'Untitled Vision',
-      keyframeUrl: approvedKeyframe.imageUrl,
-      video,
-      prompt: session.refinedPrompt,
-      createdAt: new Date().toISOString()
-    };
-
-    session.video = video;
-    session.status = 'completed';
+    targetScene.video = video;
+    targetScene.status = 'completed';
     session.expiresAt = Date.now() + SESSION_TTL_MS;
-    recentDreams.unshift(completedDream);
 
-    emitDreamProgress(session.dreamId, {
-      stage: 'COMPLETED',
-      stageLabel: 'Dream Manifestation Complete',
-      detail: 'Video generated successfully',
-      percent: 100,
-      elapsedSeconds: video.durationSeconds,
-      jobId: jobData.jobId,
-      queuePosition: 0,
-      currentScene: 1,
-      totalScenes: session.scenes?.length || 1,
-      result: video
-    });
+    console.log(`🎬 [SceneWorker] Scene #${targetScene.sceneNumber} synthesized successfully for dream ${session.dreamId}`);
+
+    // Check Multi-Scene Completion and Stitching
+    const totalScenes = session.scenes.length;
+    if (totalScenes === 1) {
+      // Single scene: No stitching needed
+      session.video = video;
+      session.status = 'completed';
+
+      recentDreams.unshift({
+        id: session.dreamId,
+        title: jobData.dreamTitle || 'Untitled Vision',
+        keyframeUrl: approvedKeyframe.imageUrl,
+        video,
+        prompt: session.refinedPrompt,
+        createdAt: new Date().toISOString()
+      });
+
+      emitDreamProgress(session.dreamId, {
+        stage: 'COMPLETED',
+        stageLabel: 'Dream Manifestation Complete',
+        detail: 'Video generated successfully',
+        percent: 100,
+        elapsedSeconds: video.durationSeconds,
+        jobId: jobData.jobId,
+        queuePosition: 0,
+        currentScene: 1,
+        totalScenes: 1,
+        result: video
+      });
+    } else {
+      // Multi-scene: Check if all scenes have finished
+      const allCompleted = session.scenes.every(s => s.status === 'completed' && s.video);
+
+      if (allCompleted) {
+        console.log(`🎬 [SceneWorker] All ${totalScenes} scenes completed for dream ${session.dreamId}. Launching FFmpeg stitching...`);
+        emitDreamProgress(session.dreamId, {
+          stage: 'STITCHING',
+          stageLabel: 'Stitching Dream Scenes',
+          detail: `Applying dynamic crossfade transition across ${totalScenes} scenes with FFmpeg...`,
+          percent: 92,
+          elapsedSeconds: 0,
+          jobId: jobData.jobId,
+          currentScene: totalScenes,
+          totalScenes
+        });
+
+        // Collect all local scene video files in sceneNumber order
+        const sortedScenes = [...session.scenes].sort((a, b) => a.sceneNumber - b.sceneNumber);
+        const inputPaths = sortedScenes.map(s => getLocalVideoPath(s.video!.videoUrl));
+        const stitchedFilename = `stitched_${session.dreamId}.mp4`;
+        const stitchedPath = path.join(STORAGE_VIDEOS_DIR, stitchedFilename);
+
+        const stitchResult = await stitchSceneVideos(inputPaths, stitchedPath, WAN_TRANSITION_SECONDS);
+
+        const finalVideo: DreamVideoResult = {
+          id: `stitched_${session.dreamId}`,
+          videoUrl: `${SERVER_BASE_URL}/api/media/videos/${stitchedFilename}`,
+          durationSeconds: stitchResult.durationSeconds,
+          effectiveSeconds: stitchResult.durationSeconds * 2,
+          fps: 24,
+          playbackRate: 0.5,
+          faceBlurred: false,
+          audioMood: session.scenes[0]?.mood ? String(session.scenes[0].mood).toLowerCase() : 'ethereal',
+          shaderPreset: 'dream_haze',
+          isMock: dreamProvider.isMock,
+          isStitched: true
+        };
+
+        session.video = finalVideo;
+        session.status = 'completed';
+
+        recentDreams.unshift({
+          id: session.dreamId,
+          title: jobData.dreamTitle || 'Multi-Scene Vision',
+          keyframeUrl: sortedScenes[0]?.keyframes?.[0]?.imageUrl || approvedKeyframe.imageUrl,
+          video: finalVideo,
+          prompt: session.refinedPrompt,
+          createdAt: new Date().toISOString()
+        });
+
+        emitDreamProgress(session.dreamId, {
+          stage: 'COMPLETED',
+          stageLabel: 'Multi-Scene Dream Manifestation Complete',
+          detail: `Seamlessly stitched ${totalScenes} scenes (${stitchResult.durationSeconds.toFixed(1)}s)`,
+          percent: 100,
+          elapsedSeconds: finalVideo.durationSeconds,
+          jobId: jobData.jobId,
+          queuePosition: 0,
+          currentScene: totalScenes,
+          totalScenes,
+          result: finalVideo
+        });
+      } else {
+        const completedCount = session.scenes.filter(s => s.status === 'completed').length;
+        emitDreamProgress(session.dreamId, {
+          stage: 'SAVING',
+          stageLabel: `Scene #${targetScene.sceneNumber} Complete (${completedCount}/${totalScenes})`,
+          detail: 'Awaiting completion of remaining scenes...',
+          percent: Math.round((completedCount / totalScenes) * 100),
+          elapsedSeconds: video.durationSeconds,
+          jobId: jobData.jobId,
+          queuePosition: 0,
+          currentScene: targetScene.sceneNumber,
+          totalScenes
+        });
+      }
+    }
 
     return video;
   } catch (err: any) {
-    session.status = 'failed';
-    // Atomic refund of credit reservation on generation failure
+    targetScene.status = 'failed';
+    targetScene.error = err.message;
+
+    // Atomic refund of ONLY this scene's credit reservation on generation failure
     demoUser.reservedCredits = Math.max(0, demoUser.reservedCredits - jobData.reservedCredits);
+
     emitDreamProgress(session.dreamId, {
       stage: 'ERROR',
-      stageLabel: 'Synthesis Failed',
+      stageLabel: `Synthesis Failed for Scene #${targetScene.sceneNumber}`,
       detail: err.message,
       percent: 0,
       elapsedSeconds: 0,
-      jobId: jobData.jobId
+      jobId: jobData.jobId,
+      currentScene: targetScene.sceneNumber,
+      totalScenes: session.scenes.length
     });
     throw err;
   }
@@ -583,7 +736,7 @@ async function processGpuJob(jobData: GpuJobData, updateJobProgress: (prog: Drea
 }
 
 // Step 3: Animate Approved Keyframe into Dream Video (Asynchronous Queue Architecture)
-// Dispatches job to queue, atomically reserves credits, and immediately returns HTTP 202 Accepted
+// Dispatches per-scene job to queue, atomically reserves credit, and immediately returns HTTP 202 Accepted
 app.post('/api/dreams/generate-video', async (req, res) => {
   const parseResult = GenerateVideoSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -593,7 +746,7 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     });
   }
 
-  const { dreamId, keyframeId, dreamTitle } = parseResult.data;
+  const { dreamId, sceneNumber, keyframeId, dreamTitle } = parseResult.data;
   const session = dreamSessions.get(dreamId);
   if (!session) {
     return res.status(404).json({
@@ -602,24 +755,36 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     });
   }
 
-  // 1. Session-level lock: Prevent duplicate concurrent requests on the same session (409 Conflict)
-  if (session.status === 'generating' || session.status === 'queued') {
-    return res.status(409).json({
-      error: 'GENERATION_IN_PROGRESS',
-      message: 'A video generation job is already queued or generating for this dream session. Please wait.'
+  const targetScene = session.scenes.find(s => s.sceneNumber === sceneNumber) || session.scenes[0];
+  if (!targetScene) {
+    return res.status(404).json({
+      error: 'SCENE_NOT_FOUND',
+      message: `Scene #${sceneNumber} not found in this dream session.`
     });
   }
 
-  // 2. Validate selected keyframe strictly from server session
-  const approvedKeyframe = session.keyframes.find(k => k.id === keyframeId);
+  // 1. Scene-level lock: Prevent duplicate concurrent requests on the same scene (409 Conflict)
+  if (targetScene.status === 'video_queued' || targetScene.status === 'rendering') {
+    return res.status(409).json({
+      error: 'GENERATION_IN_PROGRESS',
+      message: `A video generation job is already queued or generating for Scene #${targetScene.sceneNumber}. Please wait.`
+    });
+  }
+
+  // 2. Validate selected keyframe strictly from scene or session
+  const approvedKeyframe = targetScene?.keyframes?.find(k => k.id === keyframeId) ||
+    session.keyframes.find(k => k.id === keyframeId);
+
   if (!approvedKeyframe) {
     return res.status(400).json({
       error: 'INVALID_KEYFRAME_ID',
-      message: 'The selected keyframe does not exist in this dream session.'
+      message: `The selected keyframe does not exist in Scene #${targetScene.sceneNumber}.`
     });
   }
 
-  // 3. Credit Reservation Guard: Check available unreserved credits
+  targetScene.selectedKeyframeId = approvedKeyframe.id;
+
+  // 3. Credit Reservation Guard: Check available unreserved credits (1 credit per scene)
   const cost = 1;
   const availableCredits = demoUser.credits - demoUser.reservedCredits;
   if (availableCredits < cost) {
@@ -629,19 +794,20 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     });
   }
 
-  // Atomically reserve credits at queue entry time (finalized on success, refunded on failure)
+  // Atomically reserve 1 credit for this scene
   demoUser.reservedCredits += cost;
 
   const jobId = `job_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
-  session.status = 'queued';
-  session.activeJobId = jobId;
+  targetScene.status = 'video_queued';
+  targetScene.activeJobId = jobId;
 
   const { queuePosition } = await dreamQueue.addJob({
     jobType: 'VIDEO',
     jobId,
     dreamId,
+    sceneNumber: targetScene.sceneNumber,
     userId: demoUser.id,
-    keyframeId,
+    keyframeId: approvedKeyframe.id,
     dreamTitle: dreamTitle || 'Lucid Vision',
     reservedCredits: cost,
     enqueuedAt: Date.now()
@@ -650,14 +816,14 @@ app.post('/api/dreams/generate-video', async (req, res) => {
   // Emit initial SSE QUEUED event
   emitDreamProgress(dreamId, {
     stage: 'QUEUED',
-    stageLabel: `In Queue (Position #${queuePosition})`,
+    stageLabel: `Scene #${targetScene.sceneNumber} in Queue (Position #${queuePosition})`,
     detail: queuePosition === 1 ? 'Next up for rendering on GPU' : `${queuePosition - 1} job(s) ahead in queue`,
     percent: 0,
     elapsedSeconds: 0,
     jobId,
     queuePosition,
-    currentScene: 1,
-    totalScenes: session.scenes?.length || 1
+    currentScene: targetScene.sceneNumber,
+    totalScenes: session.scenes.length
   });
 
   // Asynchronous Response: HTTP 202 Accepted
@@ -665,15 +831,118 @@ app.post('/api/dreams/generate-video', async (req, res) => {
     success: true,
     jobId,
     dreamId,
+    sceneNumber: targetScene.sceneNumber,
     status: 'queued',
     queuePosition,
     reservedCredits: cost,
     availableCredits: demoUser.credits - demoUser.reservedCredits,
-    message: 'Video generation job queued successfully'
+    message: `Video generation job for Scene #${targetScene.sceneNumber} queued successfully`
   });
 });
 
-// Step 4: Job Status & Polling Endpoint
+// Step 3b: "Generate Missing Scenes" Batch Endpoint
+// Automatically queues all pending or failed scenes in a multi-scene dream session
+app.post('/api/dreams/generate-scenes', async (req, res) => {
+  const parseResult = GenerateScenesSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'INVALID_REQUEST',
+      message: parseResult.error.errors[0]?.message || 'Invalid request'
+    });
+  }
+
+  const { dreamId, dreamTitle } = parseResult.data;
+  const session = dreamSessions.get(dreamId);
+  if (!session) {
+    return res.status(404).json({
+      error: 'SESSION_NOT_FOUND',
+      message: 'Dream session expired or invalid. Please re-analyze your dream.'
+    });
+  }
+
+  // Find scenes that have keyframes ready but are not completed or currently queued
+  const uncompletedScenes = session.scenes.filter(s => 
+    s.status !== 'completed' && s.status !== 'video_queued' && s.status !== 'rendering'
+  );
+
+  if (uncompletedScenes.length === 0) {
+    return res.json({
+      success: true,
+      message: 'All scenes are already completed or actively rendering in the queue.',
+      scenes: session.scenes
+    });
+  }
+
+  // Check required credits: 1 per uncompleted scene
+  const requiredCredits = uncompletedScenes.length;
+  const availableCredits = demoUser.credits - demoUser.reservedCredits;
+  if (availableCredits < requiredCredits) {
+    return res.status(402).json({
+      error: 'INSUFFICIENT_CREDITS',
+      message: `Insufficient dream credits. Generating ${requiredCredits} scene(s) requires ${requiredCredits} available credits, but you have ${availableCredits}.`
+    });
+  }
+
+  const queuedJobs: Array<{ jobId: string; sceneNumber: number; queuePosition: number }> = [];
+
+  for (const scene of uncompletedScenes) {
+    const keyframeId = scene.selectedKeyframeId || scene.keyframes?.[0]?.id || session.keyframes[0]?.id;
+    if (!keyframeId) {
+      continue; // Skip scenes without keyframes
+    }
+
+    demoUser.reservedCredits += 1;
+    const jobId = `job_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+    scene.status = 'video_queued';
+    scene.activeJobId = jobId;
+
+    const { queuePosition } = await dreamQueue.addJob({
+      jobType: 'VIDEO',
+      jobId,
+      dreamId,
+      sceneNumber: scene.sceneNumber,
+      userId: demoUser.id,
+      keyframeId,
+      dreamTitle: dreamTitle || `Scene #${scene.sceneNumber}`,
+      reservedCredits: 1,
+      enqueuedAt: Date.now()
+    });
+
+    queuedJobs.push({ jobId, sceneNumber: scene.sceneNumber, queuePosition });
+  }
+
+  return res.status(202).json({
+    success: true,
+    dreamId,
+    queuedJobs,
+    reservedCredits: queuedJobs.length,
+    availableCredits: demoUser.credits - demoUser.reservedCredits,
+    message: `Enqueued ${queuedJobs.length} missing scene(s) for rendering.`
+  });
+});
+
+// Step 3c: Session Inspection Endpoint (returns scene statuses, clips, and keyframes)
+app.get('/api/dreams/session/:dreamId', (req, res) => {
+  const { dreamId } = req.params;
+  const session = dreamSessions.get(dreamId);
+  if (!session) {
+    return res.status(404).json({ error: 'SESSION_NOT_FOUND', message: 'Dream session not found.' });
+  }
+
+  res.json({
+    success: true,
+    session: {
+      dreamId: session.dreamId,
+      status: session.status,
+      scenes: session.scenes,
+      video: session.video,
+      totalEstimatedSeconds: session.totalEstimatedSeconds,
+      createdAt: session.createdAt
+    }
+  });
+});
+
+// Step 4: Job Status & Polling Endpoint (Supports both Keyframes and Video jobs)
 app.get('/api/dreams/jobs/:jobId', async (req, res) => {
   const { jobId } = req.params;
   const jobStatus = await dreamQueue.getJobStatus(jobId);
@@ -685,6 +954,8 @@ app.get('/api/dreams/jobs/:jobId', async (req, res) => {
   }
 
   const session = dreamSessions.get(jobStatus.dreamId);
+  const targetScene = session?.scenes.find(s => s.sceneNumber === jobStatus.sceneNumber) || session?.scenes[0];
+
   const dream = (session?.status === 'completed' && session.video) ? {
     id: session.dreamId,
     title: 'Lucid Vision',
@@ -697,6 +968,7 @@ app.get('/api/dreams/jobs/:jobId', async (req, res) => {
   res.json({
     success: true,
     job: jobStatus,
+    keyframes: jobStatus.keyframes || targetScene?.keyframes,
     dream
   });
 });

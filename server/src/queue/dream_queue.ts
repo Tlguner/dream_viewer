@@ -166,6 +166,8 @@ export class BullMQDreamQueue implements IDreamQueue {
       resolver = res;
       rejecter = rej;
     });
+    // Prevent unhandled promise rejection if caller relies on polling instead of waitForJobResult
+    promise.catch(() => {});
     this.jobDeferreds.set(data.jobId, { resolve: resolver, reject: rejecter, promise });
 
     await this.queue.add(data.jobType.toLowerCase(), data, {
@@ -181,10 +183,11 @@ export class BullMQDreamQueue implements IDreamQueue {
       jobId: data.jobId,
       dreamId: data.dreamId,
       jobType: data.jobType,
+      sceneNumber: data.sceneNumber,
       status: 'queued',
       queuePosition,
       progress: 0,
-      currentScene: 1,
+      currentScene: data.sceneNumber || 1,
       totalScenes: 1,
       stageLabel: `Queued (Position #${queuePosition})`
     };
@@ -268,16 +271,19 @@ export class MemoryDreamQueue implements IDreamQueue {
       resolver = res;
       rejecter = rej;
     });
+    // Prevent unhandled promise rejection if caller relies on polling instead of waitForJobResult
+    promise.catch(() => {});
     this.jobDeferreds.set(data.jobId, { resolve: resolver, reject: rejecter, promise });
 
     const initialStatus: GpuJobStatusResponse = {
       jobId: data.jobId,
       dreamId: data.dreamId,
       jobType: data.jobType,
+      sceneNumber: data.sceneNumber,
       status: 'queued',
       queuePosition,
       progress: 0,
-      currentScene: 1,
+      currentScene: data.sceneNumber || 1,
       totalScenes: 1,
       stageLabel: `Queued in GPU Queue (Position #${queuePosition})`
     };
@@ -317,11 +323,15 @@ export class MemoryDreamQueue implements IDreamQueue {
     this.updateWaitingPositions();
 
     const isKeyframes = jobData.jobType === 'KEYFRAMES';
+    const scenePrefix = jobData.sceneNumber ? `Scene #${jobData.sceneNumber}` : 'Scene';
     const status = this.jobStatuses.get(jobData.jobId);
     if (status) {
       status.status = 'rendering';
       status.queuePosition = 0;
-      status.stageLabel = isKeyframes ? 'Generating Keyframe Visions on GPU' : 'GPU Video Synthesis Started';
+      status.currentScene = jobData.sceneNumber || 1;
+      status.stageLabel = isKeyframes 
+        ? `Generating Keyframe Visions on GPU (${scenePrefix})` 
+        : `GPU Video Synthesis Started (${scenePrefix})`;
     }
 
     const deferred = this.jobDeferreds.get(jobData.jobId);

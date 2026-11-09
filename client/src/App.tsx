@@ -89,6 +89,35 @@ export function App() {
     return eventSource;
   };
 
+  // Helper to poll asynchronous GPU keyframe jobs (202 Accepted pattern)
+  const pollJobForKeyframes = async (jobId: string): Promise<any[]> => {
+    return new Promise((resolve, reject) => {
+      const timer = setInterval(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/dreams/jobs/${jobId}`);
+          if (res.ok) {
+            const data = await res.json();
+            const readyKeyframes = data.keyframes || data.job?.keyframes;
+            if (data.job?.status === 'completed' && readyKeyframes && readyKeyframes.length > 0) {
+              clearInterval(timer);
+              resolve(readyKeyframes);
+            } else if (data.job?.status === 'failed') {
+              clearInterval(timer);
+              reject(new Error(data.job.error || 'Keyframe generation failed in queue'));
+            }
+          }
+        } catch {
+          // Ignore transient polling blips
+        }
+      }, 1500);
+
+      setTimeout(() => {
+        clearInterval(timer);
+        reject(new Error('Keyframe generation timed out after 5 minutes.'));
+      }, 300000);
+    });
+  };
+
   // Step 1: Analyze Dream with Dream Architect & Moderation Shield
   const handleAnalyze = async (rawText: string, moodHint: string) => {
     setIsAnalyzing(true);
@@ -111,7 +140,7 @@ export function App() {
       setCurrentDreamId(dreamId);
       setAnalysisData(data.data);
 
-      // Step 2: Trigger Keyframe generation with live SSE progress stream
+      // Step 2: Trigger Keyframe generation with live SSE progress stream (Asynchronous 202 Queue)
       const sse = subscribeToProgress(dreamId, 'KEYFRAMES');
       try {
         const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
@@ -123,8 +152,15 @@ export function App() {
         const kfData = await kfRes.json();
         if (!kfRes.ok) throw new Error(kfData.message || 'Failed to generate keyframes');
 
-        setKeyframes(kfData.keyframes);
-        setSelectedKeyframe(kfData.keyframes[0]);
+        let readyKeyframes: any[] = [];
+        if (kfRes.status === 202 || kfData.status === 'queued') {
+          readyKeyframes = await pollJobForKeyframes(kfData.jobId);
+        } else {
+          readyKeyframes = kfData.keyframes;
+        }
+
+        setKeyframes(readyKeyframes);
+        setSelectedKeyframe(readyKeyframes[0]);
         setStep('KEYFRAMES');
       } finally {
         sse.close();
@@ -152,9 +188,18 @@ export function App() {
       });
 
       const kfData = await kfRes.json();
-      if (kfData.keyframes) {
-        setKeyframes(kfData.keyframes);
-        setSelectedKeyframe(kfData.keyframes[0]);
+      if (!kfRes.ok) throw new Error(kfData.message || 'Failed to regenerate keyframes');
+
+      let readyKeyframes: any[] = [];
+      if (kfRes.status === 202 || kfData.status === 'queued') {
+        readyKeyframes = await pollJobForKeyframes(kfData.jobId);
+      } else {
+        readyKeyframes = kfData.keyframes;
+      }
+
+      if (readyKeyframes && readyKeyframes.length > 0) {
+        setKeyframes(readyKeyframes);
+        setSelectedKeyframe(readyKeyframes[0]);
       }
     } catch (err) {
       console.error(err);
