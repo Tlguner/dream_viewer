@@ -420,4 +420,223 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       expect(splitConflict.body.error).toBe('DREAM_BUSY');
     });
   });
+
+  describe('Architect Concurrency Lock & Single-Scene Synthesis (Race Conditions & Post-LLM Moderation)', () => {
+    let delayedAppInstance: ReturnType<typeof createApp>;
+    let delayedLedger: CreditLedger;
+
+    beforeEach(() => {
+      const SERVER_ROOT = path.resolve(__dirname, '..');
+      const STORAGE_DIR = path.join(SERVER_ROOT, 'storage');
+      const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
+      // Mock architect with 80ms delay to reliably test concurrency race conditions
+      const delayedArchitect = new MockDreamArchitect(80);
+      const provider = new MockDreamProvider(
+        'http://127.0.0.1:5000',
+        path.join(STORAGE_DIR, 'videos'),
+        path.join(STORAGE_DIR, 'keyframes'),
+        FIXTURES_DIR,
+        delayedArchitect
+      );
+      delayedLedger = new CreditLedger({
+        'usr_demo_101': { credits: 10, reservedCredits: 0 }
+      });
+
+      delayedAppInstance = createApp({
+        dreamProvider: provider,
+        dreamArchitect: delayedArchitect,
+        creditLedger: delayedLedger,
+        queueDriver: 'memory',
+        transitionSeconds: 0.3
+      });
+    });
+
+    it('should reject concurrent split requests with 409 DREAM_BUSY to prevent race conditions', async () => {
+      const analyzeRes = await request(delayedAppInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Sakin bir göl kenarı' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const sceneId = analyzeRes.body.data.scenes[0].sceneId;
+
+      // Fire two concurrent split requests simultaneously
+      const [resA, resB] = await Promise.all([
+        request(delayedAppInstance.app)
+          .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
+          .send({ newSceneText: 'Sisli dağ zirvesi' }),
+        request(delayedAppInstance.app)
+          .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
+          .send({ newSceneText: 'Karanlık orman patikası' })
+      ]);
+
+      const statuses = [resA.status, resB.status].sort();
+      expect(statuses).toEqual([200, 409]);
+
+      const conflictRes = resA.status === 409 ? resA : resB;
+      expect(conflictRes.body.error).toBe('DREAM_BUSY');
+
+      const session = delayedAppInstance.dreamSessions.get(dreamId);
+      // Since one succeeded and one was blocked by lock, scenes must be 2, not 3
+      expect(session?.scenes.length).toBe(2);
+      expect(session?.isArchitectBusy).toBe(false);
+    });
+
+    it('should reject video generation with 409 DREAM_BUSY while Architect is editing/synthesizing', async () => {
+      const analyzeRes = await request(delayedAppInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Sakin bir sahil' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const sceneId = analyzeRes.body.data.scenes[0].sceneId;
+
+      // Generate keyframe first so scene has a valid keyframe
+      const kfRes = await request(delayedAppInstance.app)
+        .post('/api/dreams/keyframes')
+        .send({ dreamId, sceneId, count: 1 })
+        .expect(202);
+      await delayedAppInstance.dreamQueue.waitForJobResult(kfRes.body.jobId);
+
+      const session = delayedAppInstance.dreamSessions.get(dreamId);
+      const kfId = session!.scenes[0].keyframes![0].id;
+
+      // Launch split (takes 80ms) and attempt video generation concurrently (after 15ms)
+      const [splitRes, videoRes] = await Promise.all([
+        request(delayedAppInstance.app)
+          .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
+          .send({ newSceneText: 'Güneş batımı' }),
+        new Promise<request.Response>((resolve, reject) => {
+          setTimeout(() => {
+            request(delayedAppInstance.app)
+              .post('/api/dreams/generate-video')
+              .send({ dreamId, sceneId, keyframeId: kfId })
+              .end((err, res) => (err ? reject(err) : resolve(res)));
+          }, 15);
+        })
+      ]);
+
+      expect(splitRes.status).toBe(200);
+      expect(videoRes.status).toBe(409);
+      expect(videoRes.body.error).toBe('DREAM_BUSY');
+      expect(session?.isArchitectBusy).toBe(false);
+    });
+
+    it('should reject merge reanalyze when post-LLM prompt audit detects prohibited content', async () => {
+      const customArchitect = new MockDreamArchitect();
+      customArchitect.synthesizeSingleScene = async () => ({
+        safety: { allowed: true, category: null },
+        scenes: [{
+          sceneNumber: 1,
+          summary: 'Karanlık kule',
+          mood: 'DARK_SURREAL',
+          keyframePrompt: 'A gothic castle with çıplak figures in the shadows', // flagged word: çıplak
+          motionPrompt: 'Camera tracking forward through the hall',
+          cameraMotion: 'Pan forward'
+        }]
+      });
+
+      const SERVER_ROOT = path.resolve(__dirname, '..');
+      const customApp = createApp({
+        dreamProvider: new MockDreamProvider(
+          'http://127.0.0.1:5000',
+          path.join(SERVER_ROOT, 'storage', 'videos'),
+          path.join(SERVER_ROOT, 'storage', 'keyframes'),
+          path.join(SERVER_ROOT, 'fixtures'),
+          customArchitect
+        ),
+        dreamArchitect: customArchitect,
+        creditLedger: new CreditLedger({ 'usr_demo_101': { credits: 10, reservedCredits: 0 } }),
+        queueDriver: 'memory',
+        transitionSeconds: 0.3
+      });
+
+      const analyzeRes = await request(customApp.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Denizde yüzüyordum || sisli bir ada' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const scenes = analyzeRes.body.data.scenes;
+      expect(scenes.length).toBe(2);
+
+      // Attempt merge with reanalyze -> post-LLM moderation audit MUST catch the flagged keyframe prompt
+      const mergeRes = await request(customApp.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scenes[0].sceneId}/merge`)
+        .send({ targetSceneId: scenes[1].sceneId, strategy: 'reanalyze' })
+        .expect(400);
+
+      expect(mergeRes.body.error).toBe('MODERATION_REJECTED');
+      expect(mergeRes.body.categories).toContain('NSFW_OR_ADULT');
+
+      // Verify session was NOT corrupted and scenes remain 2
+      const session = customApp.dreamSessions.get(dreamId);
+      expect(session?.scenes.length).toBe(2);
+      expect(session?.isArchitectBusy).toBe(false);
+    });
+
+    it('should fail with explicit error if architect returns multiple scenes during single-scene synthesis', async () => {
+      const multiSceneArchitect = new MockDreamArchitect();
+      multiSceneArchitect.synthesizeSingleScene = async () => ({
+        safety: { allowed: true, category: null },
+        scenes: [
+          {
+            sceneNumber: 1,
+            summary: 'Scene 1',
+            mood: 'ETHEREAL_LUCID',
+            keyframePrompt: 'Keyframe 1',
+            motionPrompt: 'Motion 1',
+            cameraMotion: 'Pan'
+          },
+          {
+            sceneNumber: 2,
+            summary: 'Scene 2',
+            mood: 'ETHEREAL_LUCID',
+            keyframePrompt: 'Keyframe 2',
+            motionPrompt: 'Motion 2',
+            cameraMotion: 'Pan'
+          }
+        ]
+      });
+
+      const SERVER_ROOT = path.resolve(__dirname, '..');
+      const customApp = createApp({
+        dreamProvider: new MockDreamProvider(
+          'http://127.0.0.1:5000',
+          path.join(SERVER_ROOT, 'storage', 'videos'),
+          path.join(SERVER_ROOT, 'storage', 'keyframes'),
+          path.join(SERVER_ROOT, 'fixtures'),
+          multiSceneArchitect
+        ),
+        dreamArchitect: multiSceneArchitect,
+        creditLedger: new CreditLedger({ 'usr_demo_101': { credits: 10, reservedCredits: 0 } }),
+        queueDriver: 'memory',
+        transitionSeconds: 0.3
+      });
+
+      const analyzeRes = await request(customApp.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Deniz || Orman' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const scenes = analyzeRes.body.data.scenes;
+
+      // 1. Merge must fail if architect returns 2 scenes
+      const mergeRes = await request(customApp.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scenes[0].sceneId}/merge`)
+        .send({ targetSceneId: scenes[1].sceneId, strategy: 'reanalyze' })
+        .expect(400);
+
+      expect(mergeRes.body.error).toBe('MERGE_FAILED');
+
+      // 2. Split must fail if architect returns 2 scenes
+      const splitRes = await request(customApp.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scenes[0].sceneId}/split`)
+        .send({ newSceneText: 'Deniz ve orman' })
+        .expect(400);
+
+      expect(splitRes.body.error).toBe('SPLIT_FAILED');
+    });
+  });
 });

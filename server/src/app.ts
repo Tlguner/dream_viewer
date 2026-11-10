@@ -215,6 +215,9 @@ export function createApp(options?: AppOptions) {
   });
 
   function isSessionBusy(session: DreamSession): boolean {
+    if (session.isArchitectBusy) {
+      return true;
+    }
     if (session.status === 'stitching' || session.status === 'stitching_queued') {
       return true;
     }
@@ -756,6 +759,13 @@ export function createApp(options?: AppOptions) {
         });
       }
 
+      if (session.isArchitectBusy) {
+        return res.status(409).json({
+          error: 'DREAM_BUSY',
+          message: 'Storyboard düzenlenirken keyframe üretimi başlatılamaz.'
+        });
+      }
+
       // Bug 3 Fix: Do NOT fall back to scenes[0]! Look up by sceneId or sceneNumber
       const targetScene = sceneId 
         ? session.scenes.find(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId)
@@ -835,6 +845,13 @@ export function createApp(options?: AppOptions) {
       return res.status(404).json({
         error: 'SESSION_NOT_FOUND',
         message: 'Dream session expired or invalid. Please re-analyze your dream.'
+      });
+    }
+
+    if (session.isArchitectBusy) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'Storyboard düzenlenirken video üretimi başlatılamaz.'
       });
     }
 
@@ -945,6 +962,13 @@ export function createApp(options?: AppOptions) {
       });
     }
 
+    if (session.isArchitectBusy) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'Storyboard düzenlenirken video üretimi başlatılamaz.'
+      });
+    }
+
     // Find scenes that are uncompleted
     const uncompletedScenes = session.scenes.filter(s => 
       s.status !== 'completed' && s.status !== 'video_queued' && s.status !== 'rendering'
@@ -1035,6 +1059,13 @@ export function createApp(options?: AppOptions) {
       return res.status(404).json({
         error: 'SESSION_NOT_FOUND',
         message: 'Dream session expired or invalid.'
+      });
+    }
+
+    if (session.isArchitectBusy) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'Storyboard düzenlenirken video birleştirilemez.'
       });
     }
 
@@ -1179,14 +1210,23 @@ export function createApp(options?: AppOptions) {
       });
     }
 
+    // Acquire active editing lock for session before invoking Architect
+    session.isArchitectBusy = true;
     try {
-      // Call Dream Architect to generate structured prompts for the new scene
-      const architectAnalysis = await dreamArchitect.analyzeDream(newSceneText, targetScene.mood);
+      // Call Dream Architect to synthesize exactly ONE cohesive single scene
+      const architectAnalysis = await dreamArchitect.synthesizeSingleScene(newSceneText, targetScene.mood);
       if (!architectAnalysis.safety.allowed) {
         return res.status(400).json({
           error: 'MODERATION_REJECTED',
           message: 'Yeni sahne konsepti moderasyon filtresine takıldı.',
           categories: architectAnalysis.safety.category ? [architectAnalysis.safety.category] : ['SAFETY_VIOLATION']
+        });
+      }
+
+      if (architectAnalysis.scenes.length !== 1) {
+        return res.status(400).json({
+          error: 'SPLIT_FAILED',
+          message: `Yeni sahne için tek bir sahne üretilemedi (Dönen: ${architectAnalysis.scenes.length}). Lütfen tek bir mekân/eylem belirtin.`
         });
       }
 
@@ -1243,6 +1283,8 @@ export function createApp(options?: AppOptions) {
     } catch (err: any) {
       console.error('Error splitting scene:', err);
       return res.status(500).json({ error: 'SPLIT_FAILED', message: err.message });
+    } finally {
+      session.isArchitectBusy = false;
     }
   });
 
@@ -1308,13 +1350,15 @@ export function createApp(options?: AppOptions) {
     const sceneB = session.scenes[idxB];
     const minIdx = Math.min(idxA, idxB);
 
+    // Acquire active editing lock for session before invoking Architect
+    session.isArchitectBusy = true;
     try {
       if (strategy === 'keep_current') {
         session.scenes.splice(idxB, 1);
       } else if (strategy === 'keep_target') {
         session.scenes.splice(idxA, 1);
       } else {
-        // Strategy === 'reanalyze': synthesize unified scene via Architect
+        // Strategy === 'reanalyze': synthesize unified single scene via Architect
         const combinedNarrative = `${sceneA.summary}. ${sceneB.summary}`;
         const modResult = SafetyShield.auditPrompt(combinedNarrative);
         if (!modResult.passed) {
@@ -1325,7 +1369,7 @@ export function createApp(options?: AppOptions) {
           });
         }
 
-        const architectAnalysis = await dreamArchitect.analyzeDream(combinedNarrative, sceneA.mood);
+        const architectAnalysis = await dreamArchitect.synthesizeSingleScene(combinedNarrative, sceneA.mood);
         if (!architectAnalysis.safety.allowed) {
           return res.status(400).json({
             error: 'MODERATION_REJECTED',
@@ -1334,9 +1378,34 @@ export function createApp(options?: AppOptions) {
           });
         }
 
+        if (architectAnalysis.scenes.length !== 1) {
+          return res.status(400).json({
+            error: 'MERGE_FAILED',
+            message: `Sahneler tek bir sahnede birleştirilemedi (Dönen: ${architectAnalysis.scenes.length}).`
+          });
+        }
+
         const mergedPlan = architectAnalysis.scenes[0];
         if (!mergedPlan) {
           throw new Error('Architect failed to synthesize merged scene');
+        }
+
+        // Layer 3 Moderation on synthesized prompts
+        const kfMod = SafetyShield.auditPrompt(mergedPlan.keyframePrompt);
+        if (!kfMod.passed) {
+          return res.status(400).json({
+            error: 'MODERATION_REJECTED',
+            message: `Birleştirilen keyframe promptu moderasyonu geçemedi: ${kfMod.reason}`,
+            categories: kfMod.flaggedCategories
+          });
+        }
+        const motionMod = SafetyShield.auditPrompt(mergedPlan.motionPrompt);
+        if (!motionMod.passed) {
+          return res.status(400).json({
+            error: 'MODERATION_REJECTED',
+            message: `Birleştirilen motion promptu moderasyonu geçemedi: ${motionMod.reason}`,
+            categories: motionMod.flaggedCategories
+          });
         }
 
         const mergedScene: DreamScenePlan = {
@@ -1369,6 +1438,8 @@ export function createApp(options?: AppOptions) {
     } catch (err: any) {
       console.error('Error merging scenes:', err);
       return res.status(500).json({ error: 'MERGE_FAILED', message: err.message });
+    } finally {
+      session.isArchitectBusy = false;
     }
   });
 

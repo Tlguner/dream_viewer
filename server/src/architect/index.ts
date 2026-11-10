@@ -13,6 +13,7 @@ export interface IDreamArchitect {
   name: string;
   isMock: boolean;
   analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse>;
+  synthesizeSingleScene(narrative: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse>;
 }
 
 export class OpenAICompatibleArchitect implements IDreamArchitect {
@@ -185,6 +186,41 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
 
     return zodResult.data as DreamArchitectResponse;
   }
+
+  public async synthesizeSingleScene(narrative: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse> {
+    const cleanText = this.sanitizeInput(narrative);
+    const selectedMood = moodHint && MOOD_STYLES.includes(moodHint) ? moodHint : 'ETHEREAL_LUCID';
+
+    const userMessage = 
+      `User Selected Mood Style: ${selectedMood}\n\n` +
+      `Below is a multi-element dream narrative that MUST be synthesized into EXACTLY ONE cohesive, transitional single scene without dividing into separate scenes:\n` +
+      `<user_dream_input>\n${cleanText}\n</user_dream_input>\n\n` +
+      `CRITICAL REQUIREMENT: Output EXACTLY 1 scene in the 'scenes' array that unifies these atmospheric elements into a seamless cinematic visual and motion progression. Do NOT divide into multiple scenes. Output strict JSON conforming to the schema.`;
+
+    const messages = [
+      { role: 'system', content: DREAM_ARCHITECT_SYSTEM_PROMPT },
+      { role: 'user', content: userMessage }
+    ];
+
+    console.log(`🧠 [DreamArchitect] Invoking LLM to synthesize single cohesive scene...`);
+    let currentOutput = await this.callLlm(messages);
+    let parsedJson: any;
+    try {
+      parsedJson = JSON.parse(currentOutput);
+    } catch (parseErr: any) {
+      throw new Error(`LLM output was not valid JSON during single scene synthesis: ${parseErr.message}`);
+    }
+
+    const zodResult = DreamArchitectResponseSchema.safeParse(parsedJson);
+    if (!zodResult.success) {
+      throw new Error(`LLM output failed Zod schema validation during single scene synthesis: ${zodResult.error.message}`);
+    }
+    if (zodResult.data.scenes.length !== 1) {
+      throw new Error(`Architect was instructed to produce 1 cohesive scene but returned ${zodResult.data.scenes.length} scenes.`);
+    }
+
+    return zodResult.data as DreamArchitectResponse;
+  }
 }
 
 /**
@@ -194,9 +230,14 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
 export class MockDreamArchitect implements IDreamArchitect {
   public name = 'MockDreamArchitect (Deterministic Offline Test Engine)';
   public isMock = true;
+  public delayMs: number;
+
+  constructor(delayMs = 20) {
+    this.delayMs = delayMs;
+  }
 
   public async analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse> {
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, this.delayMs));
     const lower = rawText.toLowerCase();
 
     // 1. Safety check (Unicode boundary safe)
@@ -243,6 +284,36 @@ export class MockDreamArchitect implements IDreamArchitect {
           mood: defaultMood,
           keyframePrompt: `${rawText}. Cinematic composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
           motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${rawText}. Smooth continuous 24fps camera motion.`,
+          cameraMotion: 'Slow forward tracking push with gentle weightless float'
+        }
+      ]
+    };
+  }
+
+  public async synthesizeSingleScene(narrative: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse> {
+    await new Promise(r => setTimeout(r, this.delayMs));
+    const lower = narrative.toLowerCase();
+
+    // 1. Safety check (Unicode boundary safe)
+    if (/(?:^|\s|[.,!?;:])(çıplak|ciplak|nude|naked|erotic|gore|porn|behead)(?:$|\s|[.,!?;:])/i.test(lower)) {
+      return {
+        safety: { allowed: false, category: 'EXPLICIT_CONTENT' },
+        scenes: []
+      };
+    }
+
+    const defaultMood = moodHint || 'ETHEREAL_LUCID';
+    const cleanNarrative = narrative.replace(/\|\|/g, ', seamlessly transitioning into ');
+
+    return {
+      safety: { allowed: true, category: null },
+      scenes: [
+        {
+          sceneNumber: 1,
+          summary: cleanNarrative.length > 50 ? cleanNarrative.substring(0, 50) + '...' : cleanNarrative,
+          mood: defaultMood,
+          keyframePrompt: `${cleanNarrative}. Cinematic single cohesive composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
+          motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${cleanNarrative}. Smooth continuous 24fps camera motion.`,
           cameraMotion: 'Slow forward tracking push with gentle weightless float'
         }
       ]

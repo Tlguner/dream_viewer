@@ -95,6 +95,7 @@ export interface DreamSession {
   status: 'draft' | 'analyzed' | 'keyframes_ready' | 'queued' | 'generating' | 'completed' | 'failed' | 'stitching_queued' | 'stitching' | 'stitch_failed';
   activeJobId?: string;
   stitchJobId?: string;
+  isArchitectBusy?: boolean;
   error?: string;
   createdAt: string;
   expiresAt: number;
