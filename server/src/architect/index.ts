@@ -282,7 +282,7 @@ export class MockDreamArchitect implements IDreamArchitect {
           sceneNumber: 1,
           summary: rawText.length > 40 ? rawText.substring(0, 40) + '...' : rawText,
           mood: defaultMood,
-          keyframePrompt: `${rawText}. Cinematic composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
+          keyframePrompt: `${rawText}. Detailed physical composition, sharp material textures, volumetric directional lighting, distinct foreground focus.`,
           motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${rawText}. Smooth continuous 24fps camera motion.`,
           cameraMotion: 'Slow forward tracking push with gentle weightless float'
         }
@@ -312,7 +312,7 @@ export class MockDreamArchitect implements IDreamArchitect {
           sceneNumber: 1,
           summary: cleanNarrative.length > 50 ? cleanNarrative.substring(0, 50) + '...' : cleanNarrative,
           mood: defaultMood,
-          keyframePrompt: `${cleanNarrative}. Cinematic single cohesive composition, crisp focal clarity, evocative dreamlike atmosphere, photorealistic detail, 8k quality.`,
+          keyframePrompt: `${cleanNarrative}. Detailed unified physical composition, sharp material textures, volumetric directional lighting, distinct foreground focus.`,
           motionPrompt: `Slow cinematic forward tracking push through the dreamscape: ${cleanNarrative}. Smooth continuous 24fps camera motion.`,
           cameraMotion: 'Slow forward tracking push with gentle weightless float'
         }
