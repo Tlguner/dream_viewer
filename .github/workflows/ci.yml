@@ -44,6 +44,11 @@ jobs:
           cd server
           npm run build
 
+      - name: Run Server Unit & Integration Tests (Vitest)
+        run: |
+          cd server
+          npm test
+
       - name: Run Backend Integration & Moderation Verification Tests
         env:
           DREAM_PROVIDER: mock

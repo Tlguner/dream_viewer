@@ -1,20 +1,18 @@
 import { useState, useEffect } from 'react';
 import { Navbar } from './components/Navbar';
 import { DreamInputStep } from './components/DreamInputStep';
-import { KeyframeReviewStep } from './components/KeyframeReviewStep';
+import { StoryboardStep, type DreamScene } from './components/StoryboardStep';
 import { DreamPlayerStep } from './components/DreamPlayerStep';
 import { ManifestingHUD, type LiveProgress } from './components/ManifestingHUD';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000/api';
 
-type Step = 'INPUT' | 'KEYFRAMES' | 'PLAYER';
+type Step = 'INPUT' | 'STORYBOARD' | 'PLAYER';
 
 export function App() {
   const [step, setStep] = useState<Step>('INPUT');
   const [credits, setCredits] = useState<number>(10);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isLoadingVideo, setIsLoadingVideo] = useState(false);
-  const [isRegenerating, setIsRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Live real-time progress HUD state
@@ -22,7 +20,7 @@ export function App() {
   const [hudMode, setHudMode] = useState<'KEYFRAMES' | 'VIDEO'>('VIDEO');
   const [isHudOpen, setIsHudOpen] = useState<boolean>(false);
 
-  // Initial provider info starts in honest mock/detecting state so it never falsely flashes GPU
+  // Initial provider info starts in honest mock/detecting state
   const [providerInfo, setProviderInfo] = useState<{ name: string; isMock: boolean }>({
     name: 'Detecting Provider...',
     isMock: true
@@ -30,21 +28,30 @@ export function App() {
 
   // Stateful dream pipeline
   const [currentDreamId, setCurrentDreamId] = useState<string | null>(null);
-  const [analysisData, setAnalysisData] = useState<any>(null);
-  const [keyframes, setKeyframes] = useState<any[]>([]);
-  const [, setSelectedKeyframe] = useState<any>(null);
+  const [scenes, setScenes] = useState<DreamScene[]>([]);
+  const [sessionStatus, setSessionStatus] = useState<string>('analyzed');
+  const [sessionVideo, setSessionVideo] = useState<any>(null);
+  const [sessionError, setSessionError] = useState<string | undefined>(undefined);
   const [completedDream, setCompletedDream] = useState<any>(null);
 
   // Fetch initial profile & provider health
-  useEffect(() => {
+  const refreshUserProfile = () => {
     fetch(`${API_BASE}/user/profile`)
       .then(res => res.json())
       .then(data => {
-        if (data.credits !== undefined) setCredits(data.credits);
+        if (data.availableCredits !== undefined) {
+          setCredits(data.availableCredits);
+        } else if (data.credits !== undefined) {
+          setCredits(data.credits);
+        }
       })
       .catch(() => {
         setCredits(10);
       });
+  };
+
+  useEffect(() => {
+    refreshUserProfile();
 
     fetch(`${API_BASE}/health`)
       .then(res => res.json())
@@ -77,6 +84,27 @@ export function App() {
       try {
         const data = JSON.parse(event.data);
         setLiveProgress(data);
+
+        // Update active scene rendering status if matching scene progress
+        if (data.currentScene) {
+          setScenes(prev => prev.map(s => {
+            if (s.sceneNumber === data.currentScene) {
+              return {
+                ...s,
+                status: data.stage === 'COMPLETED' ? 'completed' : 'rendering'
+              };
+            }
+            return s;
+          }));
+        }
+
+        // If stitching stage received
+        if (data.stage === 'STITCHING') {
+          setSessionStatus('stitching');
+        } else if (data.stage === 'COMPLETED' && data.result?.videoUrl) {
+          setSessionStatus('completed');
+          setSessionVideo(data.result);
+        }
       } catch {
         // ignore non-json
       }
@@ -118,6 +146,25 @@ export function App() {
     });
   };
 
+  // Helper to fetch latest session state
+  const refreshSession = async (dreamId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/dreams/session/${dreamId}`);
+      if (res.ok) {
+        const data = await res.json();
+        const s = data.session;
+        if (s) {
+          if (s.scenes) setScenes(s.scenes);
+          if (s.status) setSessionStatus(s.status);
+          if (s.video) setSessionVideo(s.video);
+          if (s.error) setSessionError(s.error);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh session:', err);
+    }
+  };
+
   // Step 1: Analyze Dream with Dream Architect & Moderation Shield
   const handleAnalyze = async (rawText: string, moodHint: string) => {
     setIsAnalyzing(true);
@@ -131,41 +178,58 @@ export function App() {
       });
 
       const data = await res.json();
-
       if (!res.ok) {
         throw new Error(data.message || 'Dream moderation check failed.');
       }
 
       const dreamId = data.dreamId;
       setCurrentDreamId(dreamId);
-      setAnalysisData(data.data);
+      const initialScenes: DreamScene[] = (data.data.scenes || []).map((s: any, idx: number) => ({
+        ...s,
+        sceneNumber: idx + 1,
+        status: 'pending'
+      }));
+      setScenes(initialScenes);
+      setSessionStatus('analyzed');
 
-      // Step 2: Trigger Keyframe generation with live SSE progress stream (Asynchronous 202 Queue)
+      // Auto-generate keyframes for Scene 1
       const sse = subscribeToProgress(dreamId, 'KEYFRAMES');
       try {
         const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dreamId, count: 3 })
+          body: JSON.stringify({ dreamId, sceneNumber: 1, count: 3 })
         });
 
         const kfData = await kfRes.json();
-        if (!kfRes.ok) throw new Error(kfData.message || 'Failed to generate keyframes');
+        if (kfRes.ok) {
+          let readyKeyframes: any[] = [];
+          if (kfRes.status === 202 || kfData.status === 'queued') {
+            readyKeyframes = await pollJobForKeyframes(kfData.jobId);
+          } else {
+            readyKeyframes = kfData.keyframes;
+          }
 
-        let readyKeyframes: any[] = [];
-        if (kfRes.status === 202 || kfData.status === 'queued') {
-          readyKeyframes = await pollJobForKeyframes(kfData.jobId);
-        } else {
-          readyKeyframes = kfData.keyframes;
+          if (readyKeyframes && readyKeyframes.length > 0) {
+            setScenes(prev => prev.map(s => {
+              if (s.sceneNumber === 1) {
+                return {
+                  ...s,
+                  keyframes: readyKeyframes,
+                  selectedKeyframeId: readyKeyframes[0].id,
+                  status: 'keyframes_ready'
+                };
+              }
+              return s;
+            }));
+          }
         }
-
-        setKeyframes(readyKeyframes);
-        setSelectedKeyframe(readyKeyframes[0]);
-        setStep('KEYFRAMES');
       } finally {
         sse.close();
         setIsHudOpen(false);
       }
+
+      setStep('STORYBOARD');
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'An unexpected issue occurred while analyzing your dream.');
@@ -174,21 +238,44 @@ export function App() {
     }
   };
 
-  // Regenerate keyframes using server-side session with live progress
-  const handleRegenerateKeyframes = async () => {
+  // Storyboard Handler: Update Scenes (Split, Merge, Prompt Edits)
+  const handleUpdateScenes = async (updatedScenes: DreamScene[]) => {
+    setScenes(updatedScenes);
     if (!currentDreamId) return;
-    setIsRegenerating(true);
+
+    try {
+      const res = await fetch(`${API_BASE}/dreams/session/${currentDreamId}/scenes`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenes: updatedScenes })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.scenes) setScenes(data.scenes);
+      }
+    } catch (err) {
+      console.error('Failed to sync updated scenes to server:', err);
+    }
+  };
+
+  // Storyboard Handler: Generate Keyframes for a Single Scene
+  const handleGenerateKeyframesForScene = async (sceneNumber: number) => {
+    if (!currentDreamId) return;
+
+    setScenes(prev => prev.map(s => {
+      if (s.sceneNumber === sceneNumber) return { ...s, status: 'keyframes_queued' };
+      return s;
+    }));
 
     const sse = subscribeToProgress(currentDreamId, 'KEYFRAMES');
     try {
       const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dreamId: currentDreamId, count: 3 })
+        body: JSON.stringify({ dreamId: currentDreamId, sceneNumber, count: 3 })
       });
-
       const kfData = await kfRes.json();
-      if (!kfRes.ok) throw new Error(kfData.message || 'Failed to regenerate keyframes');
+      if (!kfRes.ok) throw new Error(kfData.message || 'Keyframe generation failed');
 
       let readyKeyframes: any[] = [];
       if (kfRes.status === 202 || kfData.status === 'queued') {
@@ -198,22 +285,67 @@ export function App() {
       }
 
       if (readyKeyframes && readyKeyframes.length > 0) {
-        setKeyframes(readyKeyframes);
-        setSelectedKeyframe(readyKeyframes[0]);
+        setScenes(prev => prev.map(s => {
+          if (s.sceneNumber === sceneNumber) {
+            return {
+              ...s,
+              keyframes: readyKeyframes,
+              selectedKeyframeId: readyKeyframes[0].id,
+              status: 'keyframes_ready'
+            };
+          }
+          return s;
+        }));
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setScenes(prev => prev.map(s => {
+        if (s.sceneNumber === sceneNumber) return { ...s, status: 'failed', error: err.message };
+        return s;
+      }));
     } finally {
       sse.close();
       setIsHudOpen(false);
-      setIsRegenerating(false);
     }
   };
 
-  // Step 3: Animate Approved Keyframe into Video via server-locked IDs with live SSE progress
-  const handleAnimate = async (keyframe: any) => {
+  // Storyboard Handler: Generate All Missing Keyframes
+  const handleGenerateAllKeyframes = async () => {
+    const pendingScenes = scenes.filter(s => !s.keyframes || s.keyframes.length === 0);
+    for (const sc of pendingScenes) {
+      await handleGenerateKeyframesForScene(sc.sceneNumber);
+    }
+  };
+
+  // Storyboard Handler: Select Keyframe for Scene
+  const handleSelectKeyframe = (sceneNumber: number, keyframeId: string) => {
+    setScenes(prev => prev.map(s => {
+      if (s.sceneNumber === sceneNumber) {
+        return {
+          ...s,
+          selectedKeyframeId: keyframeId,
+          status: 'keyframes_ready'
+        };
+      }
+      return s;
+    }));
+  };
+
+  // Storyboard Handler: Generate Video for a Single Scene
+  const handleGenerateSingleSceneVideo = async (sceneNumber: number) => {
     if (!currentDreamId) return;
-    setIsLoadingVideo(true);
+
+    const targetScene = scenes.find(s => s.sceneNumber === sceneNumber);
+    const keyframeId = targetScene?.selectedKeyframeId || targetScene?.keyframes?.[0]?.id;
+    if (!keyframeId) {
+      alert(`Lütfen önce Sahne #${sceneNumber} için bir keyframe seçin.`);
+      return;
+    }
+
+    setScenes(prev => prev.map(s => {
+      if (s.sceneNumber === sceneNumber) return { ...s, status: 'video_queued' };
+      return s;
+    }));
 
     const sse = subscribeToProgress(currentDreamId, 'VIDEO');
     try {
@@ -222,92 +354,197 @@ export function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           dreamId: currentDreamId,
-          keyframeId: keyframe.id,
-          dreamTitle: 'Lucid Vision'
+          sceneNumber,
+          keyframeId,
+          dreamTitle: `Scene #${sceneNumber}`
         })
       });
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Video generation failed');
 
-      if (data.availableCredits !== undefined) {
-        setCredits(data.availableCredits);
-      } else if (data.remainingCredits !== undefined) {
-        setCredits(data.remainingCredits);
-      }
+      refreshUserProfile();
 
-      // Handle Asynchronous Queue Job (HTTP 202 Accepted)
-      if (res.status === 202 || data.status === 'queued') {
-        const jobId = data.jobId;
-        console.log(`🎬 Video generation job enqueued: ${jobId}. Waiting for worker synthesis...`);
-
-        // Resilient polling fallback alongside SSE
+      // Poll until video job finishes
+      if (data.jobId) {
         await new Promise<void>((resolve, reject) => {
           const pollTimer = setInterval(async () => {
             try {
-              const jobRes = await fetch(`${API_BASE}/dreams/jobs/${jobId}`);
+              const jobRes = await fetch(`${API_BASE}/dreams/jobs/${data.jobId}`);
               if (jobRes.ok) {
                 const jobPayload = await jobRes.json();
-                if (jobPayload.job.status === 'completed' && jobPayload.dream) {
+                if (jobPayload.job.status === 'completed') {
                   clearInterval(pollTimer);
-                  const dreamResult = {
-                    ...jobPayload.dream,
-                    isMock: providerInfo.isMock
-                  };
-                  setCompletedDream(dreamResult);
-                  setStep('PLAYER');
+                  await refreshSession(currentDreamId);
                   resolve();
                 } else if (jobPayload.job.status === 'failed') {
                   clearInterval(pollTimer);
                   reject(new Error(jobPayload.job.error || 'Video synthesis failed in queue'));
                 }
               }
-            } catch (pollErr) {
-              // Ignore temporary network blips during polling
-            }
-          }, 2500);
+            } catch {}
+          }, 2000);
 
-          // 15-minute timeout guard
           setTimeout(() => {
             clearInterval(pollTimer);
-            reject(new Error('Video generation timed out after 15 minutes.'));
-          }, 900000);
+            reject(new Error('Job timed out'));
+          }, 600000);
         });
-      } else {
-        // Direct synchronous response fallback
-        const dreamResult = {
-          ...data.dream,
-          isMock: providerInfo.isMock
-        };
-        setCompletedDream(dreamResult);
-        setStep('PLAYER');
       }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'Failed to generate dream video.');
+      setScenes(prev => prev.map(s => {
+        if (s.sceneNumber === sceneNumber) return { ...s, status: 'failed', error: err.message };
+        return s;
+      }));
     } finally {
       sse.close();
       setIsHudOpen(false);
-      setIsLoadingVideo(false);
+      refreshUserProfile();
     }
+  };
+
+  // Storyboard Handler: Generate All Missing Scenes (Batch Queue)
+  const handleGenerateAllMissingScenes = async () => {
+    if (!currentDreamId) return;
+
+    setScenes(prev => prev.map(s => {
+      if (s.status !== 'completed') return { ...s, status: 'video_queued' };
+      return s;
+    }));
+
+    const sse = subscribeToProgress(currentDreamId, 'VIDEO');
+    try {
+      const res = await fetch(`${API_BASE}/dreams/generate-scenes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dreamId: currentDreamId })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Batch generation failed');
+
+      refreshUserProfile();
+
+      // Poll session periodically until all scenes are completed and stitched
+      await new Promise<void>((resolve, reject) => {
+        const sessionTimer = setInterval(async () => {
+          try {
+            const sRes = await fetch(`${API_BASE}/dreams/session/${currentDreamId}`);
+            if (sRes.ok) {
+              const sData = await sRes.json();
+              const currentSession = sData.session;
+              if (currentSession) {
+                if (currentSession.scenes) setScenes(currentSession.scenes);
+                if (currentSession.status) setSessionStatus(currentSession.status);
+                if (currentSession.video) setSessionVideo(currentSession.video);
+
+                if (currentSession.status === 'completed' || currentSession.status === 'stitch_failed') {
+                  clearInterval(sessionTimer);
+                  resolve();
+                }
+              }
+            }
+          } catch {}
+        }, 2500);
+
+        setTimeout(() => {
+          clearInterval(sessionTimer);
+          reject(new Error('Multi-scene generation timed out'));
+        }, 900000);
+      });
+    } catch (err: any) {
+      console.error(err);
+      await refreshSession(currentDreamId);
+      throw err;
+    } finally {
+      sse.close();
+      setIsHudOpen(false);
+      refreshUserProfile();
+    }
+  };
+
+  // Storyboard Handler: Free Re-Stitch
+  const handleReStitch = async () => {
+    if (!currentDreamId) return;
+    setSessionStatus('stitching_queued');
+
+    try {
+      const res = await fetch(`${API_BASE}/dreams/stitch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dreamId: currentDreamId })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Re-stitching failed');
+
+      // Poll stitch job
+      if (data.jobId) {
+        await new Promise<void>((resolve, reject) => {
+          const pollTimer = setInterval(async () => {
+            try {
+              const jobRes = await fetch(`${API_BASE}/dreams/jobs/${data.jobId}`);
+              if (jobRes.ok) {
+                const jobPayload = await jobRes.json();
+                if (jobPayload.job.status === 'completed') {
+                  clearInterval(pollTimer);
+                  await refreshSession(currentDreamId);
+                  resolve();
+                } else if (jobPayload.job.status === 'failed') {
+                  clearInterval(pollTimer);
+                  reject(new Error(jobPayload.job.error || 'Stitching failed'));
+                }
+              }
+            } catch {}
+          }, 2000);
+
+          setTimeout(() => {
+            clearInterval(pollTimer);
+            reject(new Error('Stitching timed out'));
+          }, 180000);
+        });
+      }
+    } catch (err: any) {
+      console.error(err);
+      setSessionStatus('stitch_failed');
+      setSessionError(err.message);
+    }
+  };
+
+  // Transition to Player Step
+  const handleWatchDream = (finalVideo: any) => {
+    const dreamResult = {
+      id: currentDreamId || 'dream_view',
+      title: 'Cinematic Dream Vision',
+      keyframeUrl: scenes[0]?.keyframes?.[0]?.imageUrl || '',
+      video: finalVideo,
+      prompt: scenes.map(s => s.summary).join(' • '),
+      createdAt: new Date().toISOString(),
+      isMock: providerInfo.isMock
+    };
+    setCompletedDream(dreamResult);
+    setStep('PLAYER');
   };
 
   // Reset for a new dream
   const handleNewDream = () => {
     setStep('INPUT');
     setCurrentDreamId(null);
-    setAnalysisData(null);
-    setKeyframes([]);
-    setSelectedKeyframe(null);
+    setScenes([]);
+    setSessionStatus('analyzed');
+    setSessionVideo(null);
+    setSessionError(undefined);
     setCompletedDream(null);
     setError(null);
     setIsHudOpen(false);
+    refreshUserProfile();
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#060713] text-slate-100">
+    <div className="min-h-screen flex flex-col bg-[#060713] text-slate-100 font-sans">
       
-      {/* Navigation Bar with honest provider indicator */}
+      {/* Navigation Bar */}
       <Navbar credits={credits} providerInfo={providerInfo} />
 
       {/* Main Flow Content */}
@@ -320,16 +557,24 @@ export function App() {
           />
         )}
 
-        {step === 'KEYFRAMES' && analysisData && (
-          <KeyframeReviewStep
-            analysis={analysisData}
-            keyframes={keyframes}
-            onSelectKeyframe={setSelectedKeyframe}
-            onAnimate={handleAnimate}
+        {step === 'STORYBOARD' && currentDreamId && (
+          <StoryboardStep
+            dreamId={currentDreamId}
+            scenes={scenes}
+            sessionStatus={sessionStatus}
+            sessionVideo={sessionVideo}
+            sessionError={sessionError}
+            userCredits={credits}
+            liveProgress={liveProgress}
+            onUpdateScenes={handleUpdateScenes}
+            onGenerateKeyframesForScene={handleGenerateKeyframesForScene}
+            onGenerateAllKeyframes={handleGenerateAllKeyframes}
+            onSelectKeyframe={handleSelectKeyframe}
+            onGenerateSingleSceneVideo={handleGenerateSingleSceneVideo}
+            onGenerateAllMissingScenes={handleGenerateAllMissingScenes}
+            onReStitch={handleReStitch}
+            onWatchDream={handleWatchDream}
             onBack={() => setStep('INPUT')}
-            onRegenerate={handleRegenerateKeyframes}
-            isLoadingVideo={isLoadingVideo}
-            isRegenerating={isRegenerating}
           />
         )}
 
@@ -350,12 +595,12 @@ export function App() {
       />
 
       {/* Global Ethereal Footer */}
-      <footer className="w-full glass-panel border-t border-dream-border py-6 px-4 text-center text-xs text-slate-400">
-        <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <p>© 2026 DreamViewer. Built with 4-Layer Safety Shield & On-Twos Temporal Engine.</p>
-          <div className="flex items-center gap-4 text-slate-400">
+      <footer className="w-full glass-panel border-t border-slate-800/80 py-6 px-4 text-center text-xs text-slate-400 mt-auto">
+        <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 font-mono">
+          <p>© 2026 DreamViewer. Phase 5 Multi-Scene Storyboard & FFmpeg Crossfade Engine.</p>
+          <div className="flex items-center gap-4 text-slate-400 text-[11px]">
             <span className="hover:text-purple-300 cursor-pointer">Privacy & Face Blur</span>
-            <span className="hover:text-purple-300 cursor-pointer">PG-Rated Safety</span>
+            <span className="hover:text-purple-300 cursor-pointer">PG-Rated Moderation Shield</span>
             <span className="hover:text-purple-300 cursor-pointer">Terms of Vision</span>
           </div>
         </div>

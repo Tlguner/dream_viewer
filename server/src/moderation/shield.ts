@@ -32,7 +32,7 @@ const EXPLICIT_ADULT_WORDS = [
 const GRAPHIC_GORE_WORDS = [
   'behead', 'beheading', 'decapitate', 'decapitation', 'dismember', 
   'dismemberment', 'mutilation', 'slaughter scene', 'torture chamber',
-  'kafasını kes', 'uzuv koparma', 'işkence'
+  'kafasını kes', 'kafa kesme', 'uzuv koparma', 'işkence'
 ];
 
 // 3. Extreme Hate Speech

@@ -221,5 +221,47 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
 
       expect(res.body.error).toBe('SCENE_NOT_FOUND');
     });
+
+    it('should update storyboard scenes when splitting or merging via PUT /scenes', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Ormanda yürüyordum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+
+      // Split into 2 scenes
+      const updateRes = await request(appInstance.app)
+        .put(`/api/dreams/session/${dreamId}/scenes`)
+        .send({
+          scenes: [
+            {
+              sceneNumber: 1,
+              summary: 'Orman başlangıcı',
+              mood: 'ETHEREAL_LUCID',
+              keyframePrompt: 'Pine trees in mist',
+              motionPrompt: 'Slow camera pan',
+              cameraMotion: 'pan'
+            },
+            {
+              sceneNumber: 2,
+              summary: 'Ormanda bir kulübe',
+              mood: 'GOLDEN_DREAM',
+              keyframePrompt: 'Cozy wooden cabin',
+              motionPrompt: 'Zoom in slowly',
+              cameraMotion: 'zoom'
+            }
+          ]
+        })
+        .expect(200);
+
+      expect(updateRes.body.scenes.length).toBe(2);
+      expect(updateRes.body.scenes[0].sceneNumber).toBe(1);
+      expect(updateRes.body.scenes[1].sceneNumber).toBe(2);
+
+      const session = appInstance.dreamSessions.get(dreamId);
+      expect(session?.scenes.length).toBe(2);
+      expect(session?.totalEstimatedSeconds).toBe(10);
+    });
   });
 });

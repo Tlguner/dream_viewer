@@ -271,7 +271,11 @@ export function createApp(options?: AppOptions) {
     const session = dreamSessions.get(jobData.dreamId);
     if (!session) {
       if (jobData.reservationId) {
-        try { creditLedger.release(jobData.reservationId); } catch {}
+        try {
+          creditLedger.release(jobData.reservationId);
+        } catch (releaseErr: any) {
+          console.error(`[CreditLedger] Warning releasing reservation ${jobData.reservationId} (missing session):`, releaseErr.message);
+        }
       }
       throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
     }
@@ -279,7 +283,11 @@ export function createApp(options?: AppOptions) {
     const targetScene = session.scenes.find(s => s.sceneNumber === jobData.sceneNumber);
     if (!targetScene) {
       if (jobData.reservationId) {
-        try { creditLedger.release(jobData.reservationId); } catch {}
+        try {
+          creditLedger.release(jobData.reservationId);
+        } catch (releaseErr: any) {
+          console.error(`[CreditLedger] Warning releasing reservation ${jobData.reservationId} (missing scene):`, releaseErr.message);
+        }
       }
       throw new Error(`Scene #${jobData.sceneNumber} not found in this dream session.`);
     }
@@ -287,7 +295,11 @@ export function createApp(options?: AppOptions) {
     const approvedKeyframe = targetScene.keyframes?.find(k => k.id === jobData.keyframeId);
     if (!approvedKeyframe) {
       if (jobData.reservationId) {
-        try { creditLedger.release(jobData.reservationId); } catch {}
+        try {
+          creditLedger.release(jobData.reservationId);
+        } catch (releaseErr: any) {
+          console.error(`[CreditLedger] Warning releasing reservation ${jobData.reservationId} (missing keyframe):`, releaseErr.message);
+        }
       }
       throw new Error(`Approved keyframe ${jobData.keyframeId} not found in Scene #${targetScene.sceneNumber}.`);
     }
@@ -1071,6 +1083,46 @@ export function createApp(options?: AppOptions) {
       });
     }
     return res.json({ session });
+  });
+
+  // Storyboard Scene Updates (Split, Merge, Reorder, or Edit Prompts)
+  app.put('/api/dreams/session/:dreamId/scenes', (req, res) => {
+    const { dreamId } = req.params;
+    const session = dreamSessions.get(dreamId);
+    if (!session) {
+      return res.status(404).json({
+        error: 'SESSION_NOT_FOUND',
+        message: 'Dream session expired or invalid.'
+      });
+    }
+
+    const { scenes } = req.body;
+    if (!Array.isArray(scenes) || scenes.length === 0) {
+      return res.status(400).json({
+        error: 'INVALID_SCENES',
+        message: 'Scenes array is required and must not be empty.'
+      });
+    }
+
+    // Preserve existing scene assets (keyframes, selectedKeyframeId, video)
+    session.scenes = scenes.map((sc: any, idx: number) => {
+      const existing = session.scenes.find(s => s.sceneNumber === sc.sceneNumber);
+      return {
+        sceneNumber: idx + 1,
+        summary: sc.summary || existing?.summary || `Scene #${idx + 1}`,
+        mood: sc.mood || existing?.mood || session.mood,
+        keyframePrompt: sc.keyframePrompt || existing?.keyframePrompt || session.refinedPrompt,
+        motionPrompt: sc.motionPrompt || existing?.motionPrompt || session.motionPrompt,
+        cameraMotion: sc.cameraMotion || existing?.cameraMotion || 'smooth slow pan',
+        status: sc.status || existing?.status || 'pending',
+        keyframes: sc.keyframes || existing?.keyframes,
+        selectedKeyframeId: sc.selectedKeyframeId || existing?.selectedKeyframeId,
+        video: sc.video || existing?.video
+      };
+    });
+
+    session.totalEstimatedSeconds = session.scenes.length * 5;
+    return res.json({ success: true, scenes: session.scenes });
   });
 
   // SSE Live Progress Endpoint (Supports both /progress/:dreamId and /:dreamId/progress)
