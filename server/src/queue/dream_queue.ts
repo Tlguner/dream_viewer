@@ -323,15 +323,20 @@ export class MemoryDreamQueue implements IDreamQueue {
     this.updateWaitingPositions();
 
     const isKeyframes = jobData.jobType === 'KEYFRAMES';
+    const isStitch = jobData.jobType === 'STITCH';
     const scenePrefix = jobData.sceneNumber ? `Scene #${jobData.sceneNumber}` : 'Scene';
     const status = this.jobStatuses.get(jobData.jobId);
     if (status) {
       status.status = 'rendering';
       status.queuePosition = 0;
       status.currentScene = jobData.sceneNumber || 1;
-      status.stageLabel = isKeyframes 
-        ? `Generating Keyframe Visions on GPU (${scenePrefix})` 
-        : `GPU Video Synthesis Started (${scenePrefix})`;
+      if (isKeyframes) {
+        status.stageLabel = `Generating Keyframe Visions on GPU (${scenePrefix})`;
+      } else if (isStitch) {
+        status.stageLabel = `FFmpeg Multi-Scene Stitching`;
+      } else {
+        status.stageLabel = `GPU Video Synthesis Started (${scenePrefix})`;
+      }
     }
 
     const deferred = this.jobDeferreds.get(jobData.jobId);

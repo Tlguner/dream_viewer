@@ -91,8 +91,10 @@ export interface DreamSession {
   totalEstimatedSeconds: number;
   keyframes: KeyframeOption[];
   video?: DreamVideoResult;
-  status: 'draft' | 'analyzed' | 'keyframes_ready' | 'queued' | 'generating' | 'completed' | 'failed';
+  status: 'draft' | 'analyzed' | 'keyframes_ready' | 'queued' | 'generating' | 'completed' | 'failed' | 'stitching_queued' | 'stitching' | 'stitch_failed';
   activeJobId?: string;
+  stitchJobId?: string;
+  error?: string;
   createdAt: string;
   expiresAt: number;
 }
@@ -118,7 +120,7 @@ export type ProgressCallback = (progress: DreamProgressEvent) => void;
 
 export type QueueDriverType = 'bullmq' | 'memory';
 
-export type GpuJobType = 'KEYFRAMES' | 'VIDEO';
+export type GpuJobType = 'KEYFRAMES' | 'VIDEO' | 'STITCH';
 
 export interface KeyframeJobData {
   jobType: 'KEYFRAMES';
@@ -137,12 +139,23 @@ export interface VideoJobData {
   sceneNumber: number;
   userId: string;
   keyframeId: string;
+  reservationId?: string;
   dreamTitle?: string;
   reservedCredits: number;
   enqueuedAt: number;
 }
 
-export type GpuJobData = KeyframeJobData | VideoJobData;
+export interface StitchJobData {
+  jobType: 'STITCH';
+  jobId: string;
+  dreamId: string;
+  sceneNumber?: number;
+  userId: string;
+  dreamTitle?: string;
+  enqueuedAt: number;
+}
+
+export type GpuJobData = KeyframeJobData | VideoJobData | StitchJobData;
 
 export interface GpuJobStatusResponse {
   jobId: string;

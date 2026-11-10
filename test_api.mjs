@@ -261,6 +261,17 @@ async function runApiVerification() {
   const multiDreamId = multiDreamData.dreamId;
   assert.strictEqual(multiDreamData.data.scenes.length, 2, 'Must have 2 scenes');
 
+  // Verify Bug 3: Request non-existent sceneNumber (e.g. 3 on 2-scene dream) returns 404 SCENE_NOT_FOUND
+  const nonExistentSceneRes = await fetch(`${BASE_URL}/dreams/keyframes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dreamId: multiDreamId, sceneNumber: 3, count: 1 })
+  });
+  assert.strictEqual(nonExistentSceneRes.status, 404, 'Non-existent scene must return 404 SCENE_NOT_FOUND');
+  const nonExistentData = await nonExistentSceneRes.json();
+  assert.strictEqual(nonExistentData.error, 'SCENE_NOT_FOUND');
+  console.log('  ✓ Passed: Non-existent scene correctly returns 404 (no silent fallback to Scene 1)');
+
   // Queue keyframes for Scene 1 (202 Accepted + poll)
   const kf1Res = await fetch(`${BASE_URL}/dreams/keyframes`, {
     method: 'POST',
@@ -273,7 +284,20 @@ async function runApiVerification() {
   assert.strictEqual(kf1Result.job.status, 'completed');
   const scene1Keyframes = kf1Result.keyframes || kf1Result.job.keyframes;
 
-  // Queue keyframes for Scene 2 (202 Accepted + poll)
+  // Verify Bug 1: Call generate-scenes while Scene 2 has NO keyframes
+  // MUST return 400 KEYFRAMES_MISSING with missingScenes: [2]
+  const prematureGenScenesRes = await fetch(`${BASE_URL}/dreams/generate-scenes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dreamId: multiDreamId })
+  });
+  assert.strictEqual(prematureGenScenesRes.status, 400, 'generate-scenes must fail if any scene lacks keyframes');
+  const prematureGenData = await prematureGenScenesRes.json();
+  assert.strictEqual(prematureGenData.error, 'KEYFRAMES_MISSING');
+  assert.deepStrictEqual(prematureGenData.missingScenes, [2]);
+  console.log('  ✓ Passed: generate-scenes rejected keyframeless Scene 2 with 400 (no Scene 1 keyframe fallback)');
+
+  // Now queue keyframes for Scene 2 (202 Accepted + poll)
   const kf2Res = await fetch(`${BASE_URL}/dreams/keyframes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -289,7 +313,7 @@ async function runApiVerification() {
 
   const creditsBeforeMultiVideo = (await (await fetch(`${BASE_URL}/user/profile`)).json()).credits;
 
-  // Queue video for Scene 1 (reserves 1 credit)
+  // Queue video for Scene 1 (reserves 1 credit via CreditLedger)
   const vid1Res = await fetch(`${BASE_URL}/dreams/generate-video`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -298,7 +322,7 @@ async function runApiVerification() {
   assert.strictEqual(vid1Res.status, 202);
   const vid1Init = await vid1Res.json();
 
-  // Queue video for Scene 2 (reserves 1 credit)
+  // Queue video for Scene 2 (reserves 1 credit via CreditLedger)
   const vid2Res = await fetch(`${BASE_URL}/dreams/generate-video`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -314,11 +338,20 @@ async function runApiVerification() {
   const vid2Result = await pollJob(vid2Init.jobId);
   assert.strictEqual(vid2Result.job.status, 'completed');
 
-  // Verify session has final stitched video
-  const sessionRes = await fetch(`${BASE_URL}/dreams/session/${multiDreamId}`);
+  // Verify Bug 2: Decoupled STITCH job is automatically triggered
+  let sessionRes = await fetch(`${BASE_URL}/dreams/session/${multiDreamId}`);
   assert.strictEqual(sessionRes.status, 200);
-  const sessionData = await sessionRes.json();
-  const session = sessionData.session;
+  let sessionData = await sessionRes.json();
+  let session = sessionData.session;
+  assert(session.stitchJobId, 'Multi-scene completion must enqueue a separate STITCH job');
+
+  // Poll STITCH job until finished
+  const stitchResult = await pollJob(session.stitchJobId);
+  assert.strictEqual(stitchResult.job.status, 'completed');
+
+  sessionRes = await fetch(`${BASE_URL}/dreams/session/${multiDreamId}`);
+  sessionData = await sessionRes.json();
+  session = sessionData.session;
 
   assert.strictEqual(session.scenes[0].status, 'completed', 'Scene 1 must be completed');
   assert.strictEqual(session.scenes[1].status, 'completed', 'Scene 2 must be completed');
@@ -335,6 +368,22 @@ async function runApiVerification() {
   const creditsAfterMultiVideo = (await (await fetch(`${BASE_URL}/user/profile`)).json()).credits;
   assert.strictEqual(creditsAfterMultiVideo, creditsBeforeMultiVideo - 2, 'Exactly 2 credits must be deducted for 2 scenes');
   console.log(`  ✓ Passed: Exactly 2 credits deducted for 2 completed scenes (Remaining: ${creditsAfterMultiVideo})`);
+
+  // Test Free Re-Stitch Endpoint
+  const freeReStitchRes = await fetch(`${BASE_URL}/dreams/stitch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dreamId: multiDreamId })
+  });
+  assert.strictEqual(freeReStitchRes.status, 202);
+  const freeReStitchData = await freeReStitchRes.json();
+  assert(freeReStitchData.jobId.startsWith('stitch_'));
+  const freeReStitchPoll = await pollJob(freeReStitchData.jobId);
+  assert.strictEqual(freeReStitchPoll.job.status, 'completed');
+
+  const creditsAfterReStitch = (await (await fetch(`${BASE_URL}/user/profile`)).json()).credits;
+  assert.strictEqual(creditsAfterReStitch, creditsAfterMultiVideo, 'Re-stitching MUST be 100% free of charge');
+  console.log('  ✓ Passed: Free re-stitch endpoint verified (0 credits charged)');
 
   // 10. Phase 3: Partial Failure & Per-Scene Credit Refund Isolation
   console.log('\nTest 10: Phase 3 Per-Scene Credit Isolation & Partial Failure Recovery');
