@@ -222,7 +222,7 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       expect(res.body.error).toBe('SCENE_NOT_FOUND');
     });
 
-    it('should update storyboard scenes when splitting or merging via PUT /scenes', async () => {
+    it('should reject the removed generic PUT /scenes endpoint with 404 and block injection attacks', async () => {
       const analyzeRes = await request(appInstance.app)
         .post('/api/dreams/analyze')
         .send({ rawDreamText: 'Ormanda yürüyordum' })
@@ -230,38 +230,194 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
 
       const dreamId = analyzeRes.body.dreamId;
 
-      // Split into 2 scenes
-      const updateRes = await request(appInstance.app)
+      // Exact malicious request from user
+      const attackRes = await request(appInstance.app)
         .put(`/api/dreams/session/${dreamId}/scenes`)
         .send({
-          scenes: [
-            {
-              sceneNumber: 1,
-              summary: 'Orman başlangıcı',
-              mood: 'ETHEREAL_LUCID',
-              keyframePrompt: 'Pine trees in mist',
-              motionPrompt: 'Slow camera pan',
-              cameraMotion: 'pan'
-            },
-            {
-              sceneNumber: 2,
-              summary: 'Ormanda bir kulübe',
-              mood: 'GOLDEN_DREAM',
-              keyframePrompt: 'Cozy wooden cabin',
-              motionPrompt: 'Zoom in slowly',
-              cameraMotion: 'zoom'
-            }
-          ]
+          scenes: [{
+            keyframePrompt: "çıplak bir kadın",
+            status: "keyframes_ready",
+            keyframes: [{ id: "evil", imageUrl: "http://169.254.169.254/latest/meta-data/" }],
+            selectedKeyframeId: "evil"
+          }]
+        });
+
+      // Must be 404 since permissive PUT /scenes is abolished
+      expect(attackRes.status).toBe(404);
+    });
+
+    it('should reject NSFW or gore in PATCH /scenes/:sceneId/prompt with 400 MODERATION_REJECTED', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Ormanda yürüyordum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const sceneId = analyzeRes.body.data.scenes[0].sceneId;
+
+      const patchRes = await request(appInstance.app)
+        .patch(`/api/dreams/session/${dreamId}/scenes/${sceneId}/prompt`)
+        .send({
+          keyframePrompt: "çıplak bir kadın nehirde yüzüyor"
+        })
+        .expect(400);
+
+      expect(patchRes.body.error).toBe('MODERATION_REJECTED');
+    });
+
+    it('should ignore client-injected status, keyframes, or SSRF URLs via PATCH prompt and invalidate existing assets', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Ormanda yürüyordum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const sceneId = analyzeRes.body.data.scenes[0].sceneId;
+
+      // 1. Generate keyframes first
+      const kfRes = await request(appInstance.app)
+        .post('/api/dreams/keyframes')
+        .send({ dreamId, sceneId, count: 2 })
+        .expect(202);
+      await appInstance.dreamQueue.waitForJobResult(kfRes.body.jobId);
+
+      const sessionBefore = appInstance.dreamSessions.get(dreamId);
+      expect(sessionBefore?.scenes[0].keyframes?.length).toBe(2);
+
+      // 2. Patch prompt with attempts to inject fake video, evil SSRF keyframe, and fake completed status
+      const patchRes = await request(appInstance.app)
+        .patch(`/api/dreams/session/${dreamId}/scenes/${sceneId}/prompt`)
+        .send({
+          keyframePrompt: "A misty ancient pine forest with morning dew",
+          status: "completed",
+          keyframes: [{ id: "evil", imageUrl: "http://169.254.169.254/latest/meta-data/" }],
+          selectedKeyframeId: "evil",
+          video: { id: "fake_vid", videoUrl: "http://evil.com/video.mp4" }
         })
         .expect(200);
 
-      expect(updateRes.body.scenes.length).toBe(2);
-      expect(updateRes.body.scenes[0].sceneNumber).toBe(1);
-      expect(updateRes.body.scenes[1].sceneNumber).toBe(2);
+      expect(patchRes.body.scene.keyframePrompt).toBe("A misty ancient pine forest with morning dew");
+      // Status must be reset to pending because prompt changed
+      expect(patchRes.body.scene.status).toBe("pending");
+      // Keyframes, video, selectedKeyframeId must be wiped (not evil URLs!)
+      expect(patchRes.body.scene.keyframes).toBeUndefined();
+      expect(patchRes.body.scene.selectedKeyframeId).toBeUndefined();
+      expect(patchRes.body.scene.video).toBeUndefined();
+    });
+
+    it('should split a scene using Dream Architect and enforce max 3 scenes limit', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Karanlık bir madende yürüyordum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const initialScenes = analyzeRes.body.data.scenes;
+      expect(initialScenes.length).toBe(1);
+      const scene1Id = initialScenes[0].sceneId;
+
+      // Split scene 1 with new scene "lavanta tarlası"
+      const splitRes = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scene1Id}/split`)
+        .send({ newSceneText: "kendimi sonsuz mor bir lavanta tarlasında buldum" })
+        .expect(200);
+
+      expect(splitRes.body.scenes.length).toBe(2);
+      expect(splitRes.body.scenes[0].sceneNumber).toBe(1);
+      expect(splitRes.body.scenes[1].sceneNumber).toBe(2);
+      expect(splitRes.body.scenes[1].sceneId).toBeDefined();
+      expect(splitRes.body.scenes[1].sceneId).not.toBe(scene1Id);
+      expect(splitRes.body.scenes[1].status).toBe('pending');
+
+      const scene2Id = splitRes.body.scenes[1].sceneId;
+
+      // Split again to reach 3 scenes
+      const splitRes2 = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scene2Id}/split`)
+        .send({ newSceneText: "gökyüzünde süzülen bir ada" })
+        .expect(200);
+
+      expect(splitRes2.body.scenes.length).toBe(3);
+
+      // Attempt to split 4th scene: MUST FAIL WITH 400 MAX_SCENES_REACHED
+      const splitFailRes = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scene2Id}/split`)
+        .send({ newSceneText: "dördüncü bir mekân" })
+        .expect(400);
+
+      expect(splitFailRes.body.error).toBe('MAX_SCENES_REACHED');
+    });
+
+    it('should merge scenes using strategy and enforce min 1 scene limit', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Denizde yüzüyordum || kendimi ormanda buldum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const scenes = analyzeRes.body.data.scenes;
+      expect(scenes.length).toBe(2);
+
+      const scene1Id = scenes[0].sceneId;
+      const scene2Id = scenes[1].sceneId;
+
+      // Merge scene 1 with scene 2 using reanalyze
+      const mergeRes = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${scene1Id}/merge`)
+        .send({ targetSceneId: scene2Id, strategy: 'reanalyze' })
+        .expect(200);
+
+      expect(mergeRes.body.scenes.length).toBe(1);
+      expect(mergeRes.body.scenes[0].sceneNumber).toBe(1);
+
+      // Attempt to merge when only 1 scene: MUST FAIL WITH 400 MIN_SCENES_REACHED
+      const mergeFailRes = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${mergeRes.body.scenes[0].sceneId}/merge`)
+        .send({ targetSceneId: 'nonexistent', strategy: 'reanalyze' })
+        .expect(400);
+
+      expect(mergeFailRes.body.error).toBe('MIN_SCENES_REACHED');
+    });
+
+    it('should return 409 CONFLICT if attempting to split, merge, or patch while a job is active', async () => {
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Ormanda yürüyordum' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+      const sceneId = analyzeRes.body.data.scenes[0].sceneId;
+
+      // Generate keyframe
+      const kfRes = await request(appInstance.app)
+        .post('/api/dreams/keyframes')
+        .send({ dreamId, sceneId, count: 2 })
+        .expect(202);
+      await appInstance.dreamQueue.waitForJobResult(kfRes.body.jobId);
 
       const session = appInstance.dreamSessions.get(dreamId);
-      expect(session?.scenes.length).toBe(2);
-      expect(session?.totalEstimatedSeconds).toBe(10);
+      const kfId = session!.scenes[0].keyframes![0].id;
+
+      // Start video job
+      await request(appInstance.app)
+        .post('/api/dreams/generate-video')
+        .send({ dreamId, sceneId, keyframeId: kfId })
+        .expect(202);
+
+      // Now session has active video job (video_queued or rendering)
+      // Attempting to patch prompt must return 409
+      const patchConflict = await request(appInstance.app)
+        .patch(`/api/dreams/session/${dreamId}/scenes/${sceneId}/prompt`)
+        .send({ keyframePrompt: "Yeni prompt" })
+        .expect(409);
+      expect(patchConflict.body.error).toBe('DREAM_BUSY');
+
+      // Attempting to split must return 409
+      const splitConflict = await request(appInstance.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
+        .send({ newSceneText: "Yeni sahne" })
+        .expect(409);
+      expect(splitConflict.body.error).toBe('DREAM_BUSY');
     });
   });
 });

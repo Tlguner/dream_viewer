@@ -16,6 +16,7 @@ export interface ModerationResult {
 export type SceneStatus = 'pending' | 'keyframes_queued' | 'keyframes_ready' | 'video_queued' | 'rendering' | 'completed' | 'failed';
 
 export interface DreamScenePlan {
+  sceneId?: string;
   sceneNumber: number;
   summary: string;
   mood: MoodStyle;
@@ -126,6 +127,7 @@ export interface KeyframeJobData {
   jobType: 'KEYFRAMES';
   jobId: string;
   dreamId: string;
+  sceneId?: string;
   sceneNumber: number;
   prompt: string;
   count: number;
@@ -136,6 +138,7 @@ export interface VideoJobData {
   jobType: 'VIDEO';
   jobId: string;
   dreamId: string;
+  sceneId?: string;
   sceneNumber: number;
   userId: string;
   keyframeId: string;
@@ -160,6 +163,7 @@ export type GpuJobData = KeyframeJobData | VideoJobData | StitchJobData;
 export interface GpuJobStatusResponse {
   jobId: string;
   dreamId: string;
+  sceneId?: string;
   jobType: GpuJobType;
   sceneNumber?: number;
   status: 'queued' | 'rendering' | 'completed' | 'failed';

@@ -14,6 +14,7 @@ import {
   MoodStyle, 
   IDreamProvider, 
   DreamSession, 
+  DreamScenePlan,
   DreamProgressEvent, 
   GpuJobData, 
   KeyframeJobData, 
@@ -174,12 +175,14 @@ export function createApp(options?: AppOptions) {
 
   const KeyframesSchema = z.object({
     dreamId: z.string().min(1, 'dreamId is required'),
+    sceneId: z.string().optional(),
     sceneNumber: z.number().int().min(1).max(3).optional().default(1),
     count: z.number().int().min(1).max(4).optional().default(3)
   });
 
   const GenerateVideoSchema = z.object({
     dreamId: z.string().min(1, 'dreamId is required'),
+    sceneId: z.string().optional(),
     sceneNumber: z.number().int().min(1).max(3).optional().default(1),
     keyframeId: z.string().min(1, 'keyframeId is required'),
     dreamTitle: z.string().max(80).optional()
@@ -194,6 +197,34 @@ export function createApp(options?: AppOptions) {
     dreamId: z.string().min(1, 'dreamId is required')
   });
 
+  const SplitSceneSchema = z.object({
+    newSceneText: z.string().min(3, 'Yeni sahne açıklaması en az 3 karakter olmalıdır').max(300, 'Yeni sahne açıklaması en fazla 300 karakter olabilir')
+  });
+
+  const MergeSceneSchema = z.object({
+    targetSceneId: z.string().min(1, 'targetSceneId is required'),
+    strategy: z.enum(['keep_current', 'keep_target', 'reanalyze']).default('reanalyze')
+  });
+
+  const PatchPromptSchema = z.object({
+    summary: z.string().min(2).max(250).optional(),
+    keyframePrompt: z.string().min(5).max(1000).optional(),
+    motionPrompt: z.string().min(5).max(1000).optional()
+  }).refine(data => data.summary || data.keyframePrompt || data.motionPrompt, {
+    message: "En az bir metin alanı (summary, keyframePrompt veya motionPrompt) belirtilmelidir"
+  });
+
+  function isSessionBusy(session: DreamSession): boolean {
+    if (session.status === 'stitching' || session.status === 'stitching_queued') {
+      return true;
+    }
+    return session.scenes.some(s => 
+      s.status === 'keyframes_queued' || 
+      s.status === 'video_queued' || 
+      s.status === 'rendering'
+    );
+  }
+
   // Worker: Keyframes Processing (Concurrency: 1 on GPU)
   async function processKeyframesJob(jobData: KeyframeJobData, updateJobProgress: (prog: DreamProgressEvent) => void): Promise<KeyframeOption[]> {
     const session = dreamSessions.get(jobData.dreamId);
@@ -201,9 +232,9 @@ export function createApp(options?: AppOptions) {
       throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
     }
 
-    const targetScene = session.scenes.find(s => s.sceneNumber === jobData.sceneNumber);
+    const targetScene = session.scenes.find(s => (jobData.sceneId ? s.sceneId === jobData.sceneId : s.sceneNumber === jobData.sceneNumber));
     if (!targetScene) {
-      throw new Error(`Scene #${jobData.sceneNumber} not found in dream session.`);
+      throw new Error(`Scene not found in dream session.`);
     }
 
     targetScene.status = 'rendering';
@@ -280,7 +311,7 @@ export function createApp(options?: AppOptions) {
       throw new Error(`Dream session ${jobData.dreamId} expired or not found.`);
     }
 
-    const targetScene = session.scenes.find(s => s.sceneNumber === jobData.sceneNumber);
+    const targetScene = session.scenes.find(s => (jobData.sceneId ? s.sceneId === jobData.sceneId : s.sceneNumber === jobData.sceneNumber));
     if (!targetScene) {
       if (jobData.reservationId) {
         try {
@@ -289,7 +320,7 @@ export function createApp(options?: AppOptions) {
           console.error(`[CreditLedger] Warning releasing reservation ${jobData.reservationId} (missing scene):`, releaseErr.message);
         }
       }
-      throw new Error(`Scene #${jobData.sceneNumber} not found in this dream session.`);
+      throw new Error(`Target scene not found in this dream session.`);
     }
 
     const approvedKeyframe = targetScene.keyframes?.find(k => k.id === jobData.keyframeId);
@@ -666,8 +697,9 @@ export function createApp(options?: AppOptions) {
         negativePrompt: 'blurry, low quality, distorted anatomy, text, watermark, violent, grotesque',
         cameraMotion: analysis.scenes[0]?.cameraMotion || 'smooth slow pan',
         mood: (analysis.scenes[0]?.mood as MoodStyle) || 'ETHEREAL_LUCID',
-        scenes: analysis.scenes.map(s => ({
+        scenes: analysis.scenes.map((s, idx) => ({
           ...s,
+          sceneId: s.sceneId || `scene_${Date.now()}_${idx + 1}_${crypto.randomUUID().slice(0, 8)}`,
           status: 'pending'
         })),
         totalEstimatedSeconds,
@@ -715,7 +747,7 @@ export function createApp(options?: AppOptions) {
         });
       }
 
-      const { dreamId, sceneNumber, count } = parseResult.data;
+      const { dreamId, sceneId, sceneNumber, count } = parseResult.data;
       const session = dreamSessions.get(dreamId);
       if (!session) {
         return res.status(404).json({
@@ -724,12 +756,14 @@ export function createApp(options?: AppOptions) {
         });
       }
 
-      // Bug 3 Fix: Do NOT fall back to scenes[0]!
-      const targetScene = session.scenes.find(s => s.sceneNumber === sceneNumber);
+      // Bug 3 Fix: Do NOT fall back to scenes[0]! Look up by sceneId or sceneNumber
+      const targetScene = sceneId 
+        ? session.scenes.find(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId)
+        : session.scenes.find(s => s.sceneNumber === sceneNumber);
       if (!targetScene) {
         return res.status(404).json({
           error: 'SCENE_NOT_FOUND',
-          message: `Scene #${sceneNumber} not found in this dream session.`
+          message: `Scene not found in this dream session.`
         });
       }
 
@@ -751,6 +785,7 @@ export function createApp(options?: AppOptions) {
         jobType: 'KEYFRAMES',
         jobId,
         dreamId,
+        sceneId: targetScene.sceneId,
         sceneNumber: targetScene.sceneNumber,
         prompt: targetScene.keyframePrompt || session.refinedPrompt,
         count,
@@ -794,7 +829,7 @@ export function createApp(options?: AppOptions) {
       });
     }
 
-    const { dreamId, sceneNumber, keyframeId, dreamTitle } = parseResult.data;
+    const { dreamId, sceneId, sceneNumber, keyframeId, dreamTitle } = parseResult.data;
     const session = dreamSessions.get(dreamId);
     if (!session) {
       return res.status(404).json({
@@ -803,12 +838,14 @@ export function createApp(options?: AppOptions) {
       });
     }
 
-    // Bug 3 Fix: Do NOT fall back to scenes[0]!
-    const targetScene = session.scenes.find(s => s.sceneNumber === sceneNumber);
+    // Bug 3 Fix: Do NOT fall back to scenes[0]! Look up by sceneId or sceneNumber
+    const targetScene = sceneId 
+      ? session.scenes.find(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId)
+      : session.scenes.find(s => s.sceneNumber === sceneNumber);
     if (!targetScene) {
       return res.status(404).json({
         error: 'SCENE_NOT_FOUND',
-        message: `Scene #${sceneNumber} not found in this dream session.`
+        message: `Scene not found in this dream session.`
       });
     }
 
@@ -853,6 +890,7 @@ export function createApp(options?: AppOptions) {
       jobType: 'VIDEO',
       jobId,
       dreamId,
+      sceneId: targetScene.sceneId,
       sceneNumber: targetScene.sceneNumber,
       userId: demoUser.id,
       keyframeId: approvedKeyframe.id,
@@ -959,6 +997,7 @@ export function createApp(options?: AppOptions) {
         jobType: 'VIDEO',
         jobId,
         dreamId,
+        sceneId: scene.sceneId,
         sceneNumber: scene.sceneNumber,
         userId: demoUser.id,
         keyframeId,
@@ -1085,9 +1124,11 @@ export function createApp(options?: AppOptions) {
     return res.json({ session });
   });
 
-  // Storyboard Scene Updates (Split, Merge, Reorder, or Edit Prompts)
-  app.put('/api/dreams/session/:dreamId/scenes', (req, res) => {
-    const { dreamId } = req.params;
+  // --- NARROW STORYBOARD COMMANDS (Strict Security & State Isolation) ---
+
+  // 1. Split Scene into Two via Dream Architect
+  app.post('/api/dreams/session/:dreamId/scenes/:sceneId/split', async (req, res) => {
+    const { dreamId, sceneId } = req.params;
     const session = dreamSessions.get(dreamId);
     if (!session) {
       return res.status(404).json({
@@ -1096,33 +1137,317 @@ export function createApp(options?: AppOptions) {
       });
     }
 
-    const { scenes } = req.body;
-    if (!Array.isArray(scenes) || scenes.length === 0) {
-      return res.status(400).json({
-        error: 'INVALID_SCENES',
-        message: 'Scenes array is required and must not be empty.'
+    if (isSessionBusy(session)) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'İşlem sürerken storyboard düzenlenemez veya sahne bölünemez.'
       });
     }
 
-    // Preserve existing scene assets (keyframes, selectedKeyframeId, video)
-    session.scenes = scenes.map((sc: any, idx: number) => {
-      const existing = session.scenes.find(s => s.sceneNumber === sc.sceneNumber);
-      return {
-        sceneNumber: idx + 1,
-        summary: sc.summary || existing?.summary || `Scene #${idx + 1}`,
-        mood: sc.mood || existing?.mood || session.mood,
-        keyframePrompt: sc.keyframePrompt || existing?.keyframePrompt || session.refinedPrompt,
-        motionPrompt: sc.motionPrompt || existing?.motionPrompt || session.motionPrompt,
-        cameraMotion: sc.cameraMotion || existing?.cameraMotion || 'smooth slow pan',
-        status: sc.status || existing?.status || 'pending',
-        keyframes: sc.keyframes || existing?.keyframes,
-        selectedKeyframeId: sc.selectedKeyframeId || existing?.selectedKeyframeId,
-        video: sc.video || existing?.video
-      };
-    });
+    if (session.scenes.length >= 3) {
+      return res.status(400).json({
+        error: 'MAX_SCENES_REACHED',
+        message: 'Rüya en fazla 3 sahneye bölünebilir.'
+      });
+    }
 
-    session.totalEstimatedSeconds = session.scenes.length * 5;
-    return res.json({ success: true, scenes: session.scenes });
+    const targetIndex = session.scenes.findIndex(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId);
+    if (targetIndex === -1) {
+      return res.status(404).json({
+        error: 'SCENE_NOT_FOUND',
+        message: 'Bölünmek istenen hedef sahne bulunamadı.'
+      });
+    }
+    const targetScene = session.scenes[targetIndex];
+
+    const parseResult = SplitSceneSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: parseResult.error.errors[0]?.message || 'Invalid request'
+      });
+    }
+    const { newSceneText } = parseResult.data;
+
+    // Safety check on user input
+    const modResult = SafetyShield.auditPrompt(newSceneText);
+    if (!modResult.passed) {
+      return res.status(400).json({
+        error: 'MODERATION_REJECTED',
+        message: modResult.reason,
+        categories: modResult.flaggedCategories
+      });
+    }
+
+    try {
+      // Call Dream Architect to generate structured prompts for the new scene
+      const architectAnalysis = await dreamArchitect.analyzeDream(newSceneText, targetScene.mood);
+      if (!architectAnalysis.safety.allowed) {
+        return res.status(400).json({
+          error: 'MODERATION_REJECTED',
+          message: 'Yeni sahne konsepti moderasyon filtresine takıldı.',
+          categories: architectAnalysis.safety.category ? [architectAnalysis.safety.category] : ['SAFETY_VIOLATION']
+        });
+      }
+
+      const generatedPlan = architectAnalysis.scenes[0];
+      if (!generatedPlan) {
+        throw new Error('Architect failed to generate scene plan');
+      }
+
+      // Layer 3 Moderation on generated prompts
+      const kfMod = SafetyShield.auditPrompt(generatedPlan.keyframePrompt);
+      if (!kfMod.passed) {
+        return res.status(400).json({
+          error: 'MODERATION_REJECTED',
+          message: `Üretilen keyframe promptu moderasyonu geçemedi: ${kfMod.reason}`,
+          categories: kfMod.flaggedCategories
+        });
+      }
+      const motionMod = SafetyShield.auditPrompt(generatedPlan.motionPrompt);
+      if (!motionMod.passed) {
+        return res.status(400).json({
+          error: 'MODERATION_REJECTED',
+          message: `Üretilen motion promptu moderasyonu geçemedi: ${motionMod.reason}`,
+          categories: motionMod.flaggedCategories
+        });
+      }
+
+      const newScene: DreamScenePlan = {
+        sceneId: `scene_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
+        sceneNumber: 0,
+        summary: generatedPlan.summary || newSceneText,
+        mood: targetScene.mood,
+        keyframePrompt: generatedPlan.keyframePrompt,
+        motionPrompt: generatedPlan.motionPrompt,
+        cameraMotion: generatedPlan.cameraMotion || 'smooth slow pan',
+        status: 'pending'
+      };
+
+      // Insert directly after targetScene
+      session.scenes.splice(targetIndex + 1, 0, newScene);
+
+      // Re-index sequential scene numbers
+      session.scenes.forEach((s, idx) => {
+        s.sceneNumber = idx + 1;
+      });
+
+      session.totalEstimatedSeconds = session.scenes.length * 5;
+      session.video = undefined;
+      session.stitchJobId = undefined;
+      if (session.status === 'completed' || session.status === 'stitch_failed') {
+        session.status = 'analyzed';
+      }
+
+      return res.json({ success: true, scenes: session.scenes });
+    } catch (err: any) {
+      console.error('Error splitting scene:', err);
+      return res.status(500).json({ error: 'SPLIT_FAILED', message: err.message });
+    }
+  });
+
+  // 2. Merge Adjacent Scenes via Dream Architect or Strategy
+  app.post('/api/dreams/session/:dreamId/scenes/:sceneId/merge', async (req, res) => {
+    const { dreamId, sceneId } = req.params;
+    const session = dreamSessions.get(dreamId);
+    if (!session) {
+      return res.status(404).json({
+        error: 'SESSION_NOT_FOUND',
+        message: 'Dream session expired or invalid.'
+      });
+    }
+
+    if (isSessionBusy(session)) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'İşlem sürerken storyboard düzenlenemez veya sahneler birleştirilemez.'
+      });
+    }
+
+    if (session.scenes.length <= 1) {
+      return res.status(400).json({
+        error: 'MIN_SCENES_REACHED',
+        message: 'Rüya en az 1 sahne içermelidir.'
+      });
+    }
+
+    const parseResult = MergeSceneSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: parseResult.error.errors[0]?.message || 'Invalid request'
+      });
+    }
+    const { targetSceneId, strategy } = parseResult.data;
+
+    const idxA = session.scenes.findIndex(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId);
+    const idxB = session.scenes.findIndex(s => s.sceneId === targetSceneId || String(s.sceneNumber) === targetSceneId);
+
+    if (idxA === -1 || idxB === -1) {
+      return res.status(404).json({
+        error: 'SCENE_NOT_FOUND',
+        message: 'Birleştirilecek sahnelerden biri veya her ikisi bulunamadı.'
+      });
+    }
+
+    if (idxA === idxB) {
+      return res.status(400).json({
+        error: 'INVALID_MERGE_TARGET',
+        message: 'Bir sahne kendisiyle birleştirilemez.'
+      });
+    }
+
+    if (Math.abs(idxA - idxB) !== 1) {
+      return res.status(400).json({
+        error: 'SCENES_NOT_ADJACENT',
+        message: 'Sadece ardışık (yan yana) sahneler birleştirilebilir.'
+      });
+    }
+
+    const sceneA = session.scenes[idxA];
+    const sceneB = session.scenes[idxB];
+    const minIdx = Math.min(idxA, idxB);
+
+    try {
+      if (strategy === 'keep_current') {
+        session.scenes.splice(idxB, 1);
+      } else if (strategy === 'keep_target') {
+        session.scenes.splice(idxA, 1);
+      } else {
+        // Strategy === 'reanalyze': synthesize unified scene via Architect
+        const combinedNarrative = `${sceneA.summary}. ${sceneB.summary}`;
+        const modResult = SafetyShield.auditPrompt(combinedNarrative);
+        if (!modResult.passed) {
+          return res.status(400).json({
+            error: 'MODERATION_REJECTED',
+            message: modResult.reason,
+            categories: modResult.flaggedCategories
+          });
+        }
+
+        const architectAnalysis = await dreamArchitect.analyzeDream(combinedNarrative, sceneA.mood);
+        if (!architectAnalysis.safety.allowed) {
+          return res.status(400).json({
+            error: 'MODERATION_REJECTED',
+            message: 'Birleştirilen sahne konsepti güvenlik filtresini geçemedi.',
+            categories: architectAnalysis.safety.category ? [architectAnalysis.safety.category] : ['SAFETY_VIOLATION']
+          });
+        }
+
+        const mergedPlan = architectAnalysis.scenes[0];
+        if (!mergedPlan) {
+          throw new Error('Architect failed to synthesize merged scene');
+        }
+
+        const mergedScene: DreamScenePlan = {
+          sceneId: `scene_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
+          sceneNumber: 0,
+          summary: mergedPlan.summary || combinedNarrative,
+          mood: sceneA.mood,
+          keyframePrompt: mergedPlan.keyframePrompt,
+          motionPrompt: mergedPlan.motionPrompt,
+          cameraMotion: mergedPlan.cameraMotion || 'smooth slow pan',
+          status: 'pending'
+        };
+
+        session.scenes.splice(minIdx, 2, mergedScene);
+      }
+
+      // Re-index sequential scene numbers
+      session.scenes.forEach((s, idx) => {
+        s.sceneNumber = idx + 1;
+      });
+
+      session.totalEstimatedSeconds = session.scenes.length * 5;
+      session.video = undefined;
+      session.stitchJobId = undefined;
+      if (session.status === 'completed' || session.status === 'stitch_failed') {
+        session.status = 'analyzed';
+      }
+
+      return res.json({ success: true, scenes: session.scenes });
+    } catch (err: any) {
+      console.error('Error merging scenes:', err);
+      return res.status(500).json({ error: 'MERGE_FAILED', message: err.message });
+    }
+  });
+
+  // 3. Edit Scene Prompt (Isolated Text Only with Moderation & Asset Invalidation)
+  app.patch('/api/dreams/session/:dreamId/scenes/:sceneId/prompt', async (req, res) => {
+    const { dreamId, sceneId } = req.params;
+    const session = dreamSessions.get(dreamId);
+    if (!session) {
+      return res.status(404).json({
+        error: 'SESSION_NOT_FOUND',
+        message: 'Dream session expired or invalid.'
+      });
+    }
+
+    if (isSessionBusy(session)) {
+      return res.status(409).json({
+        error: 'DREAM_BUSY',
+        message: 'İşlem sürerken prompt düzenlenemez.'
+      });
+    }
+
+    const targetScene = session.scenes.find(s => s.sceneId === sceneId || String(s.sceneNumber) === sceneId);
+    if (!targetScene) {
+      return res.status(404).json({
+        error: 'SCENE_NOT_FOUND',
+        message: 'Sahne bulunamadı.'
+      });
+    }
+
+    const parseResult = PatchPromptSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: parseResult.error.errors[0]?.message || 'Invalid request'
+      });
+    }
+
+    const { summary, keyframePrompt, motionPrompt } = parseResult.data;
+
+    // Safety moderation on each provided text field
+    if (summary) {
+      const mod = SafetyShield.auditPrompt(summary);
+      if (!mod.passed) {
+        return res.status(400).json({ error: 'MODERATION_REJECTED', message: mod.reason, categories: mod.flaggedCategories });
+      }
+    }
+    if (keyframePrompt) {
+      const mod = SafetyShield.auditPrompt(keyframePrompt);
+      if (!mod.passed) {
+        return res.status(400).json({ error: 'MODERATION_REJECTED', message: mod.reason, categories: mod.flaggedCategories });
+      }
+    }
+    if (motionPrompt) {
+      const mod = SafetyShield.auditPrompt(motionPrompt);
+      if (!mod.passed) {
+        return res.status(400).json({ error: 'MODERATION_REJECTED', message: mod.reason, categories: mod.flaggedCategories });
+      }
+    }
+
+    // Apply allowed text updates strictly (NO status, keyframes, video, or URL mutations accepted)
+    if (summary) targetScene.summary = summary;
+    if (keyframePrompt) targetScene.keyframePrompt = keyframePrompt;
+    if (motionPrompt) targetScene.motionPrompt = motionPrompt;
+
+    // Invalidate existing generated assets because prompt was edited
+    targetScene.keyframes = undefined;
+    targetScene.selectedKeyframeId = undefined;
+    targetScene.video = undefined;
+    targetScene.status = 'pending';
+    targetScene.error = undefined;
+    targetScene.activeJobId = undefined;
+
+    session.video = undefined;
+    session.stitchJobId = undefined;
+    if (session.status === 'completed' || session.status === 'stitch_failed') {
+      session.status = 'analyzed';
+    }
+
+    return res.json({ success: true, scene: targetScene });
   });
 
   // SSE Live Progress Endpoint (Supports both /progress/:dreamId and /:dreamId/progress)

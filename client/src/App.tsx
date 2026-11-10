@@ -186,6 +186,7 @@ export function App() {
       setCurrentDreamId(dreamId);
       const initialScenes: DreamScene[] = (data.data.scenes || []).map((s: any, idx: number) => ({
         ...s,
+        sceneId: s.sceneId || `scene_${Date.now()}_${idx + 1}`,
         sceneNumber: idx + 1,
         status: 'pending'
       }));
@@ -238,32 +239,59 @@ export function App() {
     }
   };
 
-  // Storyboard Handler: Update Scenes (Split, Merge, Prompt Edits)
-  const handleUpdateScenes = async (updatedScenes: DreamScene[]) => {
-    setScenes(updatedScenes);
+  // Storyboard Handler: Split Scene into Two via Architect
+  const handleSplitScene = async (sceneId: string, newSceneText: string) => {
     if (!currentDreamId) return;
+    const res = await fetch(`${API_BASE}/dreams/session/${currentDreamId}/scenes/${sceneId}/split`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newSceneText })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.message || 'Sahne bölme işlemi başarısız oldu.');
+    }
+    if (data.scenes) setScenes(data.scenes);
+  };
 
-    try {
-      const res = await fetch(`${API_BASE}/dreams/session/${currentDreamId}/scenes`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenes: updatedScenes })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.scenes) setScenes(data.scenes);
-      }
-    } catch (err) {
-      console.error('Failed to sync updated scenes to server:', err);
+  // Storyboard Handler: Merge Adjacent Scenes
+  const handleMergeScene = async (sceneId: string, targetSceneId: string, strategy: 'keep_current' | 'keep_target' | 'reanalyze') => {
+    if (!currentDreamId) return;
+    const res = await fetch(`${API_BASE}/dreams/session/${currentDreamId}/scenes/${sceneId}/merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetSceneId, strategy })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.message || 'Sahneleri birleştirme işlemi başarısız oldu.');
+    }
+    if (data.scenes) setScenes(data.scenes);
+  };
+
+  // Storyboard Handler: Patch Scene Prompt (Isolated & Audited)
+  const handlePatchPrompt = async (sceneId: string, prompts: { summary?: string; keyframePrompt?: string; motionPrompt?: string }) => {
+    if (!currentDreamId) return;
+    const res = await fetch(`${API_BASE}/dreams/session/${currentDreamId}/scenes/${sceneId}/prompt`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(prompts)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.message || 'Prompt güncellenemedi.');
+    }
+    if (data.scene) {
+      setScenes(prev => prev.map(s => (s.sceneId === sceneId || String(s.sceneNumber) === sceneId) ? { ...s, ...data.scene } : s));
     }
   };
 
   // Storyboard Handler: Generate Keyframes for a Single Scene
-  const handleGenerateKeyframesForScene = async (sceneNumber: number) => {
+  const handleGenerateKeyframesForScene = async (sceneNumber: number, sceneId?: string) => {
     if (!currentDreamId) return;
 
     setScenes(prev => prev.map(s => {
-      if (s.sceneNumber === sceneNumber) return { ...s, status: 'keyframes_queued' };
+      if ((sceneId && s.sceneId === sceneId) || s.sceneNumber === sceneNumber) return { ...s, status: 'keyframes_queued' };
       return s;
     }));
 
@@ -272,7 +300,7 @@ export function App() {
       const kfRes = await fetch(`${API_BASE}/dreams/keyframes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dreamId: currentDreamId, sceneNumber, count: 3 })
+        body: JSON.stringify({ dreamId: currentDreamId, sceneId, sceneNumber, count: 3 })
       });
       const kfData = await kfRes.json();
       if (!kfRes.ok) throw new Error(kfData.message || 'Keyframe generation failed');
@@ -286,7 +314,7 @@ export function App() {
 
       if (readyKeyframes && readyKeyframes.length > 0) {
         setScenes(prev => prev.map(s => {
-          if (s.sceneNumber === sceneNumber) {
+          if ((sceneId && s.sceneId === sceneId) || s.sceneNumber === sceneNumber) {
             return {
               ...s,
               keyframes: readyKeyframes,
@@ -300,7 +328,7 @@ export function App() {
     } catch (err: any) {
       console.error(err);
       setScenes(prev => prev.map(s => {
-        if (s.sceneNumber === sceneNumber) return { ...s, status: 'failed', error: err.message };
+        if ((sceneId && s.sceneId === sceneId) || s.sceneNumber === sceneNumber) return { ...s, status: 'failed', error: err.message };
         return s;
       }));
     } finally {
@@ -332,10 +360,10 @@ export function App() {
   };
 
   // Storyboard Handler: Generate Video for a Single Scene
-  const handleGenerateSingleSceneVideo = async (sceneNumber: number) => {
+  const handleGenerateSingleSceneVideo = async (sceneNumber: number, sceneId?: string) => {
     if (!currentDreamId) return;
 
-    const targetScene = scenes.find(s => s.sceneNumber === sceneNumber);
+    const targetScene = sceneId ? scenes.find(s => s.sceneId === sceneId) : scenes.find(s => s.sceneNumber === sceneNumber);
     const keyframeId = targetScene?.selectedKeyframeId || targetScene?.keyframes?.[0]?.id;
     if (!keyframeId) {
       alert(`Lütfen önce Sahne #${sceneNumber} için bir keyframe seçin.`);
@@ -343,7 +371,7 @@ export function App() {
     }
 
     setScenes(prev => prev.map(s => {
-      if (s.sceneNumber === sceneNumber) return { ...s, status: 'video_queued' };
+      if ((sceneId && s.sceneId === sceneId) || s.sceneNumber === sceneNumber) return { ...s, status: 'video_queued' };
       return s;
     }));
 
@@ -354,6 +382,7 @@ export function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           dreamId: currentDreamId,
+          sceneId: targetScene?.sceneId,
           sceneNumber,
           keyframeId,
           dreamTitle: `Scene #${sceneNumber}`
@@ -566,7 +595,9 @@ export function App() {
             sessionError={sessionError}
             userCredits={credits}
             liveProgress={liveProgress}
-            onUpdateScenes={handleUpdateScenes}
+            onSplitScene={handleSplitScene}
+            onMergeScene={handleMergeScene}
+            onPatchPrompt={handlePatchPrompt}
             onGenerateKeyframesForScene={handleGenerateKeyframesForScene}
             onGenerateAllKeyframes={handleGenerateAllKeyframes}
             onSelectKeyframe={handleSelectKeyframe}

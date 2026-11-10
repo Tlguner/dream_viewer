@@ -13,7 +13,8 @@ import {
   Video, 
   Edit3, 
   Save, 
-  Check
+  Check,
+  X
 } from 'lucide-react';
 
 export interface KeyframeOption {
@@ -25,6 +26,7 @@ export interface KeyframeOption {
 }
 
 export interface DreamScene {
+  sceneId?: string;
   sceneNumber: number;
   summary: string;
   mood: string;
@@ -47,11 +49,13 @@ interface StoryboardStepProps {
   sessionError?: string;
   userCredits: number;
   liveProgress?: any;
-  onUpdateScenes: (updatedScenes: DreamScene[]) => Promise<void>;
-  onGenerateKeyframesForScene: (sceneNumber: number) => Promise<void>;
+  onSplitScene: (sceneId: string, newSceneText: string) => Promise<void>;
+  onMergeScene: (sceneId: string, targetSceneId: string, strategy: 'keep_current' | 'keep_target' | 'reanalyze') => Promise<void>;
+  onPatchPrompt: (sceneId: string, prompts: { summary?: string; keyframePrompt?: string; motionPrompt?: string }) => Promise<void>;
+  onGenerateKeyframesForScene: (sceneNumber: number, sceneId?: string) => Promise<void>;
   onGenerateAllKeyframes: () => Promise<void>;
   onSelectKeyframe: (sceneNumber: number, keyframeId: string) => void;
-  onGenerateSingleSceneVideo: (sceneNumber: number) => Promise<void>;
+  onGenerateSingleSceneVideo: (sceneNumber: number, sceneId?: string) => Promise<void>;
   onGenerateAllMissingScenes: () => Promise<void>;
   onReStitch: () => Promise<void>;
   onWatchDream: (finalVideo: any) => void;
@@ -66,7 +70,9 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
   sessionError,
   userCredits,
   liveProgress,
-  onUpdateScenes,
+  onSplitScene,
+  onMergeScene,
+  onPatchPrompt,
   onGenerateKeyframesForScene,
   onGenerateAllKeyframes,
   onSelectKeyframe,
@@ -82,6 +88,21 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
     keyframePrompt: '',
     motionPrompt: ''
   });
+  const [isPatching, setIsPatching] = useState(false);
+
+  // Split Modal State
+  const [isSplitModalOpen, setIsSplitModalOpen] = useState(false);
+  const [newSceneDescription, setNewSceneDescription] = useState('');
+  const [isSplitting, setIsSplitting] = useState(false);
+  const [splitError, setSplitError] = useState<string | null>(null);
+
+  // Merge Modal State
+  const [isMergeModalOpen, setIsMergeModalOpen] = useState(false);
+  const [mergeStrategy, setMergeStrategy] = useState<'keep_current' | 'keep_target' | 'reanalyze'>('reanalyze');
+  const [isMerging, setIsMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+
+  // Batch actions state
   const [isGeneratingBatch, setIsGeneratingBatch] = useState(false);
   const [isGeneratingAllKf, setIsGeneratingAllKf] = useState(false);
   const [isReStitching, setIsReStitching] = useState(false);
@@ -99,6 +120,10 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
     s => s.status !== 'completed' && !s.selectedKeyframeId && (!s.keyframes || s.keyframes.length === 0)
   );
 
+  const activeScene = scenes.find(s => s.sceneNumber === activeSceneTab) || scenes[0];
+  const nextScene = scenes.find(s => s.sceneNumber === activeScene?.sceneNumber + 1);
+
+  // Prompt Editing Handlers
   const startEditPrompt = (scene: DreamScene) => {
     setEditingSceneNum(scene.sceneNumber);
     setEditedPrompt({
@@ -107,90 +132,83 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
     });
   };
 
-  const saveEditPrompt = async (sceneNumber: number) => {
-    const updated = scenes.map(s => {
-      if (s.sceneNumber === sceneNumber) {
-        return {
-          ...s,
-          keyframePrompt: editedPrompt.keyframePrompt,
-          motionPrompt: editedPrompt.motionPrompt
-        };
-      }
-      return s;
-    });
-    setEditingSceneNum(null);
-    await onUpdateScenes(updated);
+  const saveEditPrompt = async (scene: DreamScene) => {
+    const targetId = scene.sceneId || String(scene.sceneNumber);
+    setIsPatching(true);
+    try {
+      await onPatchPrompt(targetId, {
+        keyframePrompt: editedPrompt.keyframePrompt,
+        motionPrompt: editedPrompt.motionPrompt
+      });
+      setEditingSceneNum(null);
+    } catch (err: any) {
+      setValidationWarning(err.message || 'Prompt güncellenemedi.');
+    } finally {
+      setIsPatching(false);
+    }
   };
 
-  // Storyboard Action: Split Scene into Two
-  const handleSplitScene = async (sceneNumber: number) => {
-    if (scenes.length >= 4) {
-      alert('Maksimum 4 sahne oluşturulabilir.');
+  // Open Split Dialog
+  const handleOpenSplitModal = () => {
+    if (scenes.length >= 3) {
+      setValidationWarning('Rüya en fazla 3 sahneye bölünebilir.');
       return;
     }
-
-    const targetScene = scenes.find(s => s.sceneNumber === sceneNumber);
-    if (!targetScene) return;
-
-    const newScene1: DreamScene = {
-      ...targetScene,
-      sceneNumber,
-      summary: `${targetScene.summary} (Bölüm A)`,
-      motionPrompt: `${targetScene.motionPrompt}, initial subtle motion`
-    };
-
-    const newScene2: DreamScene = {
-      sceneNumber: sceneNumber + 1,
-      summary: `${targetScene.summary} (Bölüm B)`,
-      mood: targetScene.mood,
-      keyframePrompt: `${targetScene.keyframePrompt}, shifted perspective, dream evolution`,
-      motionPrompt: `${targetScene.motionPrompt}, continuous cinematic flow`,
-      cameraMotion: 'smooth pan forward',
-      status: 'pending'
-    };
-
-    const targetIndex = scenes.findIndex(s => s.sceneNumber === sceneNumber);
-    const updated = [
-      ...scenes.slice(0, targetIndex),
-      newScene1,
-      newScene2,
-      ...scenes.slice(targetIndex + 1)
-    ].map((s, idx) => ({ ...s, sceneNumber: idx + 1 }));
-
-    await onUpdateScenes(updated);
-    setActiveSceneTab(sceneNumber + 1);
+    setNewSceneDescription('');
+    setSplitError(null);
+    setIsSplitModalOpen(true);
   };
 
-  // Storyboard Action: Merge Scene with Next Scene
-  const handleMergeWithNext = async (sceneNumber: number) => {
-    if (sceneNumber >= scenes.length) return;
+  // Confirm Split Action via Dream Architect
+  const handleConfirmSplit = async () => {
+    if (!newSceneDescription.trim() || newSceneDescription.trim().length < 3) {
+      setSplitError('Lütfen yeni sahne için en az 3 karakterlik bir açıklama yazın.');
+      return;
+    }
+    if (!activeScene) return;
 
-    const s1 = scenes.find(s => s.sceneNumber === sceneNumber);
-    const s2 = scenes.find(s => s.sceneNumber === sceneNumber + 1);
-    if (!s1 || !s2) return;
+    setIsSplitting(true);
+    setSplitError(null);
+    try {
+      const targetId = activeScene.sceneId || String(activeScene.sceneNumber);
+      await onSplitScene(targetId, newSceneDescription.trim());
+      setIsSplitModalOpen(false);
+      setActiveSceneTab(activeScene.sceneNumber + 1);
+    } catch (err: any) {
+      setSplitError(err.message || 'Sahne bölme işlemi başarısız oldu.');
+    } finally {
+      setIsSplitting(false);
+    }
+  };
 
-    const mergedScene: DreamScene = {
-      sceneNumber,
-      summary: `${s1.summary} & ${s2.summary}`,
-      mood: s1.mood,
-      keyframePrompt: `${s1.keyframePrompt}, seamlessly blending into ${s2.keyframePrompt}`,
-      motionPrompt: `${s1.motionPrompt}, transitioning into ${s2.motionPrompt}`,
-      cameraMotion: s1.cameraMotion || 'smooth slow pan',
-      status: s1.status === 'completed' && s2.status === 'completed' ? 'completed' : 'pending',
-      keyframes: s1.keyframes || s2.keyframes,
-      selectedKeyframeId: s1.selectedKeyframeId || s2.selectedKeyframeId,
-      video: s1.video
-    };
+  // Open Merge Dialog
+  const handleOpenMergeModal = () => {
+    if (scenes.length <= 1) {
+      setValidationWarning('Rüya en az 1 sahne içermelidir.');
+      return;
+    }
+    setMergeStrategy('reanalyze');
+    setMergeError(null);
+    setIsMergeModalOpen(true);
+  };
 
-    const targetIndex = scenes.findIndex(s => s.sceneNumber === sceneNumber);
-    const updated = [
-      ...scenes.slice(0, targetIndex),
-      mergedScene,
-      ...scenes.slice(targetIndex + 2)
-    ].map((s, idx) => ({ ...s, sceneNumber: idx + 1 }));
+  // Confirm Merge Action
+  const handleConfirmMerge = async () => {
+    if (!activeScene || !nextScene) return;
 
-    await onUpdateScenes(updated);
-    setActiveSceneTab(Math.min(sceneNumber, updated.length));
+    setIsMerging(true);
+    setMergeError(null);
+    try {
+      const currentId = activeScene.sceneId || String(activeScene.sceneNumber);
+      const targetId = nextScene.sceneId || String(nextScene.sceneNumber);
+      await onMergeScene(currentId, targetId, mergeStrategy);
+      setIsMergeModalOpen(false);
+      setActiveSceneTab(Math.min(activeScene.sceneNumber, totalScenes - 1));
+    } catch (err: any) {
+      setMergeError(err.message || 'Sahneleri birleştirme işlemi başarısız oldu.');
+    } finally {
+      setIsMerging(false);
+    }
   };
 
   // Batch Trigger: Generate All Keyframes
@@ -233,8 +251,6 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
       setIsReStitching(false);
     }
   };
-
-  const activeScene = scenes.find(s => s.sceneNumber === activeSceneTab) || scenes[0];
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-8 animate-fadeIn text-slate-100">
@@ -308,7 +324,7 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
 
           return (
             <button
-              key={scene.sceneNumber}
+              key={scene.sceneId || scene.sceneNumber}
               onClick={() => setActiveSceneTab(scene.sceneNumber)}
               className={`flex-1 min-w-[160px] p-3 rounded-xl text-left transition-all relative ${
                 isCurrent
@@ -331,52 +347,49 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
                     Keyframe Seçildi
                   </span>
                 ) : (
-                  <span className="text-[10px] text-amber-400 font-medium bg-amber-500/10 px-1.5 py-0.5 rounded-full border border-amber-500/30">
-                    Keyframe Bekliyor
-                  </span>
+                  <span className="text-[10px] text-slate-500 font-mono">Bekliyor</span>
                 )}
               </div>
-              <p className="text-[11px] line-clamp-1 font-sans">{scene.summary}</p>
+              <p className="text-xs font-medium text-slate-200 line-clamp-1">{scene.summary || `Sahne #${scene.sceneNumber}`}</p>
             </button>
           );
         })}
       </div>
 
-      {/* Active Scene Editor & Keyframe Selector */}
+      {/* Active Scene Detailed Card */}
       {activeScene && (
-        <div className="glass-panel rounded-3xl p-6 sm:p-8 border border-slate-800/80 mb-6 bg-slate-950/60 shadow-2xl">
+        <div className="glass-panel rounded-3xl p-6 sm:p-8 mb-8 border border-slate-800/80 shadow-2xl relative">
           
-          {/* Scene Header & Split/Merge Actions */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-slate-800">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 flex items-center justify-center font-bold font-mono text-sm">
-                #{activeScene.sceneNumber}
+          {/* Header of Active Scene */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-slate-800/80">
+            <div>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="px-2.5 py-0.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 font-mono text-[11px] font-semibold">
+                  Sahne {activeScene.sceneNumber} / {totalScenes}
+                </span>
+                <span className="px-2.5 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono text-[11px]">
+                  {activeScene.mood}
+                </span>
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="text-base font-bold text-white">{activeScene.summary}</h3>
-                  <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-purple-300 border border-purple-500/30 font-mono">
-                    {activeScene.mood}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-400 font-mono mt-0.5">Kamera Hareketi: {activeScene.cameraMotion}</p>
-              </div>
+              <h3 className="text-lg font-bold text-white">{activeScene.summary}</h3>
             </div>
 
-            {/* Split and Merge Action Buttons */}
-            <div className="flex items-center gap-2">
+            {/* Actions for this Scene: Edit, Split, Merge */}
+            <div className="flex flex-wrap items-center gap-2">
               {editingSceneNum === activeScene.sceneNumber ? (
                 <button
-                  onClick={() => saveEditPrompt(activeScene.sceneNumber)}
-                  className="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 transition-all"
+                  onClick={() => saveEditPrompt(activeScene)}
+                  disabled={isPatching}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-all shadow-md disabled:opacity-50"
                 >
-                  <Save className="w-3.5 h-3.5" />
+                  {isPatching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
                   <span>Kaydet</span>
                 </button>
               ) : (
                 <button
                   onClick={() => startEditPrompt(activeScene)}
-                  className="px-3 py-1.5 rounded-xl bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 transition-all"
+                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 border border-slate-700 transition-all"
+                  title="Prompt metinlerini düzenle"
                 >
                   <Edit3 className="w-3.5 h-3.5" />
                   <span>Prompt Düzenle</span>
@@ -384,17 +397,18 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
               )}
 
               <button
-                onClick={() => handleSplitScene(activeScene.sceneNumber)}
-                className="px-3 py-1.5 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-purple-300 text-xs font-medium flex items-center gap-1.5 transition-all"
-                title="Bu sahneyi iki bağımsız alt sahneye böler"
+                onClick={handleOpenSplitModal}
+                disabled={totalScenes >= 3}
+                className="px-3 py-1.5 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-purple-500/30 text-purple-300 text-xs font-medium flex items-center gap-1.5 transition-all"
+                title="Yeni bir mekân ekleyerek sahneyi böl"
               >
                 <Split className="w-3.5 h-3.5" />
                 <span>Sahneyi Böl</span>
               </button>
 
-              {activeScene.sceneNumber < totalScenes && (
+              {nextScene && (
                 <button
-                  onClick={() => handleMergeWithNext(activeScene.sceneNumber)}
+                  onClick={handleOpenMergeModal}
                   className="px-3 py-1.5 rounded-xl bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/30 text-indigo-300 text-xs font-medium flex items-center gap-1.5 transition-all"
                   title="Bu sahneyi sonraki sahneyle birleştirir"
                 >
@@ -408,6 +422,10 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
           {/* Prompt Editor (if active) */}
           {editingSceneNum === activeScene.sceneNumber && (
             <div className="mt-4 p-4 rounded-2xl bg-slate-900/80 border border-cyan-500/30 space-y-3 animate-fadeIn">
+              <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>Prompt değiştirildiğinde bu sahnenin üretilmiş keyframe'leri ve videosu sıfırlanır.</span>
+              </div>
               <div>
                 <label className="text-[11px] font-mono text-cyan-300 uppercase tracking-wider block mb-1">
                   Keyframe Kompozisyon Prompt'u
@@ -445,7 +463,7 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
 
               {activeScene.keyframes && activeScene.keyframes.length > 0 && (
                 <button
-                  onClick={() => onGenerateKeyframesForScene(activeScene.sceneNumber)}
+                  onClick={() => onGenerateKeyframesForScene(activeScene.sceneNumber, activeScene.sceneId)}
                   className="text-xs text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-mono transition-colors"
                 >
                   <RefreshCw className="w-3 h-3" />
@@ -504,7 +522,7 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
                   GPU üzerinde bu sahnenin kompozisyonunu oluşturan 3 farklı sanatsal anahtar kare üretin.
                 </p>
                 <button
-                  onClick={() => onGenerateKeyframesForScene(activeScene.sceneNumber)}
+                  onClick={() => onGenerateKeyframesForScene(activeScene.sceneNumber, activeScene.sceneId)}
                   className="px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-white font-semibold text-xs shadow-lg transition-all flex items-center gap-2"
                 >
                   <Sparkles className="w-4 h-4" />
@@ -531,7 +549,7 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
             {/* Action for single scene */}
             {activeScene.status !== 'completed' && activeScene.status !== 'video_queued' && activeScene.status !== 'rendering' && (
               <button
-                onClick={() => onGenerateSingleSceneVideo(activeScene.sceneNumber)}
+                onClick={() => onGenerateSingleSceneVideo(activeScene.sceneNumber, activeScene.sceneId)}
                 disabled={!activeScene.selectedKeyframeId && (!activeScene.keyframes || activeScene.keyframes.length === 0)}
                 className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-xs shadow-lg flex items-center gap-2 transition-all"
               >
@@ -622,6 +640,183 @@ export const StoryboardStep: React.FC<StoryboardStepProps> = ({
           </div>
         </div>
       </div>
+
+      {/* MODAL 1: Split Scene Dialog */}
+      {isSplitModalOpen && activeScene && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="glass-panel w-full max-w-lg p-6 rounded-3xl border border-cyan-500/40 bg-slate-950 shadow-2xl relative">
+            <button
+              onClick={() => setIsSplitModalOpen(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-2.5 mb-2 text-cyan-400">
+              <Split className="w-5 h-5" />
+              <h3 className="text-base font-bold text-white">Sahne #{activeScene.sceneNumber} Bölme (Dream Architect)</h3>
+            </div>
+            <p className="text-xs text-slate-400 mb-4 leading-relaxed font-sans">
+              Mevcut sahnenin hemen ardına eklenecek yeni sahnenin mekânını veya olayını yazın. Dream Architect yapay zekâsı bu metni analiz ederek sinematik prompt'ları oluşturacaktır.
+            </p>
+
+            {splitError && (
+              <div className="mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{splitError}</span>
+              </div>
+            )}
+
+            <div className="space-y-3 mb-6">
+              <label className="text-[11px] font-mono text-cyan-300 uppercase tracking-wider block">
+                Yeni Sahne Konsepti / Mekânı
+              </label>
+              <textarea
+                value={newSceneDescription}
+                onChange={(e) => setNewSceneDescription(e.target.value)}
+                placeholder="Örn: kendimi mor bir lavanta tarlasında koşarken buldum"
+                className="w-full h-24 p-3 rounded-2xl bg-slate-900 border border-slate-800 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-cyan-400 leading-relaxed"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setIsSplitModalOpen(false)}
+                className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white"
+              >
+                İptal
+              </button>
+              <button
+                onClick={handleConfirmSplit}
+                disabled={isSplitting}
+                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-white font-bold text-xs shadow-lg flex items-center gap-2 transition-all disabled:opacity-50"
+              >
+                {isSplitting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                <span>{isSplitting ? 'Architect Analiz Ediyor...' : 'Böl ve Prompt Üret'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 2: Merge Scenes Dialog */}
+      {isMergeModalOpen && activeScene && nextScene && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="glass-panel w-full max-w-lg p-6 rounded-3xl border border-indigo-500/40 bg-slate-950 shadow-2xl relative">
+            <button
+              onClick={() => setIsMergeModalOpen(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-2.5 mb-2 text-indigo-400">
+              <Combine className="w-5 h-5" />
+              <h3 className="text-base font-bold text-white">
+                Sahne #{activeScene.sceneNumber} ve #{nextScene.sceneNumber} Birleştirme
+              </h3>
+            </div>
+            <p className="text-xs text-slate-400 mb-4 leading-relaxed font-sans">
+              İki sahneyi nasıl birleştirmek istediğinizi seçin. Birleştirme tamamlandığında video ve keyframe'ler sıfırlanacaktır.
+            </p>
+
+            {mergeError && (
+              <div className="mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{mergeError}</span>
+              </div>
+            )}
+
+            <div className="space-y-3 mb-6">
+              <label
+                onClick={() => setMergeStrategy('reanalyze')}
+                className={`p-3.5 rounded-2xl border cursor-pointer block transition-all ${
+                  mergeStrategy === 'reanalyze'
+                    ? 'bg-purple-900/30 border-purple-400 text-white shadow-md'
+                    : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-semibold text-xs text-purple-300">
+                  <input
+                    type="radio"
+                    name="strategy"
+                    checked={mergeStrategy === 'reanalyze'}
+                    onChange={() => setMergeStrategy('reanalyze')}
+                    className="accent-purple-400"
+                  />
+                  <span>Dream Architect İle Yeniden Sentezle (Önerilen)</span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1 pl-5">
+                  Her iki sahnenin metinlerini birleştirip tek bir tutarlı sinematik prompt üretir.
+                </p>
+              </label>
+
+              <label
+                onClick={() => setMergeStrategy('keep_current')}
+                className={`p-3.5 rounded-2xl border cursor-pointer block transition-all ${
+                  mergeStrategy === 'keep_current'
+                    ? 'bg-indigo-900/30 border-indigo-400 text-white shadow-md'
+                    : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-semibold text-xs text-indigo-300">
+                  <input
+                    type="radio"
+                    name="strategy"
+                    checked={mergeStrategy === 'keep_current'}
+                    onChange={() => setMergeStrategy('keep_current')}
+                    className="accent-indigo-400"
+                  />
+                  <span>Sadece Sahne #{activeScene.sceneNumber} Promptunu Koru</span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1 pl-5">
+                  İlk sahnenin kompozisyonunu korur, Sahne #{nextScene.sceneNumber}'yi kaldırır.
+                </p>
+              </label>
+
+              <label
+                onClick={() => setMergeStrategy('keep_target')}
+                className={`p-3.5 rounded-2xl border cursor-pointer block transition-all ${
+                  mergeStrategy === 'keep_target'
+                    ? 'bg-cyan-900/30 border-cyan-400 text-white shadow-md'
+                    : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-semibold text-xs text-cyan-300">
+                  <input
+                    type="radio"
+                    name="strategy"
+                    checked={mergeStrategy === 'keep_target'}
+                    onChange={() => setMergeStrategy('keep_target')}
+                    className="accent-cyan-400"
+                  />
+                  <span>Sadece Sahne #{nextScene.sceneNumber} Promptunu Koru</span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1 pl-5">
+                  İkinci sahnenin kompozisyonunu korur, Sahne #{activeScene.sceneNumber}'yi kaldırır.
+                </p>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setIsMergeModalOpen(false)}
+                className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white"
+              >
+                İptal
+              </button>
+              <button
+                onClick={handleConfirmMerge}
+                disabled={isMerging}
+                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white font-bold text-xs shadow-lg flex items-center gap-2 transition-all disabled:opacity-50"
+              >
+                {isMerging ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Combine className="w-4 h-4" />}
+                <span>{isMerging ? 'Birleştiriliyor...' : 'Sahneleri Birleştir'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );
