@@ -12,6 +12,7 @@ import { DREAM_ARCHITECT_SYSTEM_PROMPT } from './system_prompt.js';
 export interface IDreamArchitect {
   name: string;
   isMock: boolean;
+  model?: string | null;
   analyzeDream(rawText: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse>;
   synthesizeSingleScene(narrative: string, moodHint?: MoodStyle): Promise<DreamArchitectResponse>;
 }
@@ -21,7 +22,7 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
   public isMock = false;
 
   private baseUrl: string;
-  private model: string;
+  public readonly model: string;
   private apiKey: string;
   private timeoutMs: number;
 
@@ -230,6 +231,7 @@ export class OpenAICompatibleArchitect implements IDreamArchitect {
 export class MockDreamArchitect implements IDreamArchitect {
   public name = 'MockDreamArchitect (Deterministic Offline Test Engine)';
   public isMock = true;
+  public readonly model: string | null = null;
   public delayMs: number;
 
   constructor(delayMs = 20) {

@@ -34,8 +34,12 @@ async function runApiVerification() {
   assert.strictEqual(health.status, 'online', 'Status must be online');
   assert.strictEqual(typeof health.provider, 'string', 'Provider name must be string');
   assert.strictEqual(typeof health.isMock, 'boolean', 'isMock must be boolean');
+  assert.strictEqual(typeof health.architect, 'object', 'Architect info must be object');
+  assert.strictEqual(typeof health.architect.provider, 'string', 'Architect provider must be string');
+  assert.strictEqual(typeof health.architect.isMock, 'boolean', 'Architect isMock must be boolean');
+  assert.ok('model' in health.architect, 'Architect object must expose model key');
   assert.strictEqual(typeof health.isGpuBusy, 'boolean', 'isGpuBusy must be boolean');
-  console.log(`  ✓ Passed: Provider=${health.provider}, isMock=${health.isMock}, isGpuBusy=${health.isGpuBusy}`);
+  console.log(`  ✓ Passed: Provider=${health.provider}, isMock=${health.isMock}, Architect=${health.architect.provider} (isMock=${health.architect.isMock}), isGpuBusy=${health.isGpuBusy}`);
 
   // 2. User Profile & Credits
   console.log('\nTest 2: User profile & initial credit verification');

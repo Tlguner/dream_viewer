@@ -1,4 +1,4 @@
-import { app, defaultAppInstance } from './app.js';
+import { app, defaultAppInstance, formatMixedModeWarning } from './app.js';
 import { ComfyDreamProvider } from './providers/comfy_provider.js';
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
@@ -15,6 +15,18 @@ async function startServer() {
     console.log(`✨ Dream Viewer Server active on http://${HOST}:${PORT}`);
     console.log(`🔒 4-Layer Moderation Shield & Provider Active`);
     console.log(`📦 Credit Ledger & Asynchronous Queue Active`);
+    const archModel = defaultAppInstance.dreamArchitect.model
+      ? ` (${defaultAppInstance.dreamArchitect.model})`
+      : '';
+    console.log(`🧠 Architect Active: ${defaultAppInstance.dreamArchitect.name}${archModel}`);
+
+    const mixedWarning = formatMixedModeWarning(
+      defaultAppInstance.dreamProvider,
+      defaultAppInstance.dreamArchitect
+    );
+    if (mixedWarning) {
+      console.warn(mixedWarning);
+    }
   });
 
   const shutdown = (signal: string) => {

@@ -21,9 +21,14 @@ export function App() {
   const [isHudOpen, setIsHudOpen] = useState<boolean>(false);
 
   // Initial provider info starts in honest mock/detecting state
-  const [providerInfo, setProviderInfo] = useState<{ name: string; isMock: boolean }>({
+  const [providerInfo, setProviderInfo] = useState<{
+    name: string;
+    isMock: boolean;
+    architect?: { provider: string; model: string | null; isMock: boolean } | null;
+  }>({
     name: 'Detecting Provider...',
-    isMock: true
+    isMock: true,
+    architect: null
   });
 
   // Stateful dream pipeline
@@ -59,7 +64,14 @@ export function App() {
         if (data.provider) {
           setProviderInfo({
             name: data.provider,
-            isMock: Boolean(data.isMock)
+            isMock: Boolean(data.isMock),
+            architect: data.architect
+              ? {
+                  provider: String(data.architect.provider || ''),
+                  model: data.architect.model ?? null,
+                  isMock: Boolean(data.architect.isMock)
+                }
+              : null
           });
         }
       })

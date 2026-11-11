@@ -35,6 +35,25 @@ const SERVER_ROOT = path.resolve(__dirname, '..');
 dotenv.config({ path: path.join(SERVER_ROOT, '.env') });
 dotenv.config({ path: path.join(SERVER_ROOT, '..', '.env') });
 
+/**
+ * Returns an explicit startup warning when real GPU generation (`comfy`) is paired
+ * with the mock Dream Architect (`mock`), since scene splitting and English prompt
+ * generation are disabled in that combination.
+ */
+export function formatMixedModeWarning(
+  dreamProvider: Pick<IDreamProvider, 'isMock'>,
+  dreamArchitect: Pick<IDreamArchitect, 'isMock'>
+): string | null {
+  if (!dreamProvider.isMock && dreamArchitect.isMock) {
+    return (
+      '⚠️ [WARNING] DREAM_PROVIDER=comfy + ARCHITECT_PROVIDER=mock: ' +
+      'Real GPU rendering is active, but scene splitting and English prompt crafting are DISABLED ' +
+      '(raw text is treated as 1 scene unless "||" is used). Set ARCHITECT_PROVIDER=openai_compat for real LLM storyboarding.'
+    );
+  }
+  return null;
+}
+
 export interface AppOptions {
   dreamProvider?: IDreamProvider;
   dreamArchitect?: IDreamArchitect;
@@ -610,6 +629,11 @@ export function createApp(options?: AppOptions) {
       timestamp: new Date().toISOString(),
       provider: dreamProvider.name,
       isMock: dreamProvider.isMock,
+      architect: {
+        provider: dreamArchitect.name,
+        model: dreamArchitect.isMock ? null : (dreamArchitect.model ?? null),
+        isMock: dreamArchitect.isMock
+      },
       isGpuBusy: queueStats.active > 0,
       activeGpuJobs: queueStats.active,
       waitingQueue: queueStats.waiting,

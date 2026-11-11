@@ -7,6 +7,11 @@ interface NavbarProps {
   providerInfo?: {
     name: string;
     isMock: boolean;
+    architect?: {
+      provider: string;
+      model: string | null;
+      isMock: boolean;
+    } | null;
   };
 }
 
@@ -19,6 +24,8 @@ export const Navbar: React.FC<NavbarProps> = ({ credits, providerInfo }) => {
   };
 
   const isMock = providerInfo?.isMock ?? true;
+  const architectInfo = providerInfo?.architect;
+  const isArchitectMock = architectInfo?.isMock === true;
 
   return (
     <header className="sticky top-0 z-50 w-full glass-panel border-b border-dream-border px-6 py-4 transition-all">
@@ -32,7 +39,7 @@ export const Navbar: React.FC<NavbarProps> = ({ credits, providerInfo }) => {
             </div>
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="font-serif font-bold text-xl tracking-wide bg-gradient-to-r from-purple-200 via-indigo-200 to-cyan-200 bg-clip-text text-transparent">
                 DreamViewer
               </span>
@@ -48,8 +55,21 @@ export const Navbar: React.FC<NavbarProps> = ({ credits, providerInfo }) => {
                   RTX 5070 GPU
                 </span>
               )}
+              {isArchitectMock && (
+                <span
+                  title={architectInfo?.provider || 'MockDreamArchitect active'}
+                  className="text-[10px] tracking-wide font-semibold px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1"
+                >
+                  <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
+                  Architect: MOCK, sahne ayırma devre dışı
+                </span>
+              )}
             </div>
-            <p className="text-xs text-slate-400">Subconscious Visualizer</p>
+            <p className="text-xs text-slate-400">
+              {architectInfo && !architectInfo.isMock && architectInfo.model
+                ? `Subconscious Visualizer · Architect: ${architectInfo.model}`
+                : 'Subconscious Visualizer'}
+            </p>
           </div>
         </div>
 
