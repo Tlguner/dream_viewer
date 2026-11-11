@@ -1,24 +1,45 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { MockDreamProvider } from '../src/providers/mock_provider.js';
 import { MockDreamArchitect } from '../src/architect/index.js';
 import { CreditLedger } from '../src/billing/credit_ledger.js';
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
+
+async function waitForJobCompletion(app: any, jobId: string, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await request(app).get(`/api/dreams/jobs/${jobId}`);
+    if (res.status === 200) {
+      const status = res.body?.job?.status;
+      if (status === 'completed' || status === 'failed') {
+        return res.body;
+      }
+    }
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error(`Timed out waiting for job ${jobId} to reach terminal status within ${timeoutMs}ms`);
+}
 
 describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
   let appInstance: ReturnType<typeof createApp>;
   let ledger: CreditLedger;
+  let tempStorageDir: string;
+  const originalStorageDir = process.env.STORAGE_DIR;
 
   beforeEach(() => {
     const SERVER_ROOT = path.resolve(__dirname, '..');
-    const STORAGE_DIR = path.join(SERVER_ROOT, 'storage');
     const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
+    tempStorageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-api-bugs-'));
+    process.env.STORAGE_DIR = tempStorageDir;
+
     const architect = new MockDreamArchitect();
     const provider = new MockDreamProvider(
       'http://127.0.0.1:5000',
-      path.join(STORAGE_DIR, 'videos'),
-      path.join(STORAGE_DIR, 'keyframes'),
+      path.join(tempStorageDir, 'videos'),
+      path.join(tempStorageDir, 'keyframes'),
       FIXTURES_DIR,
       architect
     );
@@ -33,6 +54,16 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       queueDriver: 'memory',
       transitionSeconds: 0.3
     });
+  });
+
+  afterEach(async () => {
+    await appInstance.dreamQueue.close();
+    if (originalStorageDir === undefined) {
+      delete process.env.STORAGE_DIR;
+    } else {
+      process.env.STORAGE_DIR = originalStorageDir;
+    }
+    fs.rmSync(tempStorageDir, { recursive: true, force: true });
   });
 
   describe('Bug 1: Scene 2 rendered using Scene 1 keyframe fallback', () => {
@@ -123,41 +154,41 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
 
       const dreamId = analyzeRes.body.dreamId;
 
-      // Generate keyframes for both scenes
+      // Generate keyframes for both scenes and wait for actual job completion
       const kf1 = await request(appInstance.app).post('/api/dreams/keyframes').send({ dreamId, sceneNumber: 1, count: 1 }).expect(202);
       const kf2 = await request(appInstance.app).post('/api/dreams/keyframes').send({ dreamId, sceneNumber: 2, count: 1 }).expect(202);
-      await appInstance.dreamQueue.waitForJobResult(kf1.body.jobId);
-      await appInstance.dreamQueue.waitForJobResult(kf2.body.jobId);
+      const kf1Done = await waitForJobCompletion(appInstance.app, kf1.body.jobId, 15000);
+      const kf2Done = await waitForJobCompletion(appInstance.app, kf2.body.jobId, 15000);
+      expect(kf1Done.job.status).toBe('completed');
+      expect(kf2Done.job.status).toBe('completed');
 
-      const session = appInstance.dreamSessions.get(dreamId)!;
-      const kfId1 = session.scenes[0].keyframes![0].id;
-      const kfId2 = session.scenes[1].keyframes![0].id;
+      const sessionAfterKf = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      const kfId1 = sessionAfterKf.body.session.scenes[0].keyframes[0].id;
+      const kfId2 = sessionAfterKf.body.session.scenes[1].keyframes[0].id;
 
-      // Queue video for Scene 1
+      // Queue video for Scene 1 and wait for actual job completion
       const v1 = await request(appInstance.app)
         .post('/api/dreams/generate-video')
         .send({ dreamId, sceneNumber: 1, keyframeId: kfId1 })
         .expect(202);
-      await appInstance.dreamQueue.waitForJobResult(v1.body.jobId);
+      const v1Done = await waitForJobCompletion(appInstance.app, v1.body.jobId, 15000);
+      expect(v1Done.job.status).toBe('completed');
 
-      // Verify Scene 1 completed and 1 credit committed
-      expect(session.scenes[0].status).toBe('completed');
+      const afterV1Session = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      expect(afterV1Session.body.session.scenes[0].status).toBe('completed');
       expect(ledger.getBalance('usr_demo_101')).toEqual({
         credits: 9,
         reservedCredits: 0,
         availableCredits: 9
       });
 
-      // Queue video for Scene 2
+      // Queue video for Scene 2 and wait for actual job completion
       const v2 = await request(appInstance.app)
         .post('/api/dreams/generate-video')
         .send({ dreamId, sceneNumber: 2, keyframeId: kfId2 })
         .expect(202);
-      await appInstance.dreamQueue.waitForJobResult(v2.body.jobId);
-
-      // Both scenes should be completed!
-      expect(session.scenes[0].status).toBe('completed');
-      expect(session.scenes[1].status).toBe('completed');
+      const v2Done = await waitForJobCompletion(appInstance.app, v2.body.jobId, 15000);
+      expect(v2Done.job.status).toBe('completed');
 
       // Both scenes committed -> exactly 2 credits deducted (Remaining: 8)
       expect(ledger.getBalance('usr_demo_101')).toEqual({
@@ -166,25 +197,106 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
         availableCredits: 8
       });
 
-      // Session should have enqueued a STITCH job
-      expect(session.stitchJobId).toBeDefined();
-      expect(['stitching_queued', 'stitching', 'completed']).toContain(session.status);
+      const afterV2Session = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      const stitchJobId = afterV2Session.body.session.stitchJobId as string | undefined;
+      expect(afterV2Session.body.session.scenes[0].status).toBe('completed');
+      expect(afterV2Session.body.session.scenes[1].status).toBe('completed');
+      expect(stitchJobId).toBeDefined();
+      expect(['stitching_queued', 'stitching', 'completed']).toContain(afterV2Session.body.session.status);
 
-      // Wait for STITCH job
-      await appInstance.dreamQueue.waitForJobResult(session.stitchJobId!);
-      expect(session.status).toBe('completed');
-      expect(session.video?.isStitched).toBe(true);
+      // Poll real FFmpeg stitch job until it reaches terminal completed state
+      const stitchDone = await waitForJobCompletion(appInstance.app, stitchJobId!, 20000);
+      expect(stitchDone.job.status).toBe('completed');
 
-      // Re-stitch endpoint should be callable without spending credits
+      const completedSession = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      expect(completedSession.body.session.status).toBe('completed');
+      expect(completedSession.body.session.video?.isStitched).toBe(true);
+
+      // Re-stitch endpoint should run and complete without spending credits (await completion so no FFmpeg lingers)
       const stitchRes = await request(appInstance.app)
         .post('/api/dreams/stitch')
         .send({ dreamId })
         .expect(202);
 
       expect(stitchRes.body.jobId).toMatch(/^stitch_/);
+      const reStitchDone = await waitForJobCompletion(appInstance.app, stitchRes.body.jobId, 20000);
+      expect(reStitchDone.job.status).toBe('completed');
       expect(ledger.getBalance('usr_demo_101').credits).toBe(8);
       expect(ledger.getBalance('usr_demo_101').reservedCredits).toBe(0);
-    });
+    }, 30000);
+
+    it('should preserve completed scenes and credits when stitch fails and allow free re-stitch recovery', async () => {
+      const SERVER_ROOT = path.resolve(__dirname, '..');
+      const fixtureVid = path.join(SERVER_ROOT, 'fixtures', 'mock_video.mp4');
+
+      const analyzeRes = await request(appInstance.app)
+        .post('/api/dreams/analyze')
+        .send({ rawDreamText: 'Kristal mağara || Yıldızlı çöl' })
+        .expect(200);
+
+      const dreamId = analyzeRes.body.dreamId;
+
+      const kf1 = await request(appInstance.app).post('/api/dreams/keyframes').send({ dreamId, sceneNumber: 1, count: 1 }).expect(202);
+      const kf2 = await request(appInstance.app).post('/api/dreams/keyframes').send({ dreamId, sceneNumber: 2, count: 1 }).expect(202);
+      await waitForJobCompletion(appInstance.app, kf1.body.jobId, 15000);
+      await waitForJobCompletion(appInstance.app, kf2.body.jobId, 15000);
+
+      const sessionAfterKf = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      const kfId1 = sessionAfterKf.body.session.scenes[0].keyframes[0].id;
+      const kfId2 = sessionAfterKf.body.session.scenes[1].keyframes[0].id;
+
+      // Render Scene 1, then remove its clip from disk so auto-stitch fails deterministically
+      const v1 = await request(appInstance.app)
+        .post('/api/dreams/generate-video')
+        .send({ dreamId, sceneNumber: 1, keyframeId: kfId1 })
+        .expect(202);
+      const v1Done = await waitForJobCompletion(appInstance.app, v1.body.jobId, 15000);
+      expect(v1Done.job.status).toBe('completed');
+
+      const scene1VideoFilename = path.basename(v1Done.video.videoUrl);
+      const scene1VideoPath = path.join(tempStorageDir, 'videos', scene1VideoFilename);
+      fs.unlinkSync(scene1VideoPath);
+
+      // Render Scene 2 -> auto-stitch fails, but both scenes and 8 credits remain intact
+      const v2 = await request(appInstance.app)
+        .post('/api/dreams/generate-video')
+        .send({ dreamId, sceneNumber: 2, keyframeId: kfId2 })
+        .expect(202);
+      await waitForJobCompletion(appInstance.app, v2.body.jobId, 15000);
+
+      const preFailSession = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      const failedStitchDone = await waitForJobCompletion(appInstance.app, preFailSession.body.session.stitchJobId, 20000);
+      expect(failedStitchDone.job.status).toBe('failed');
+
+      const failedSession = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      expect(failedSession.body.session.status).toBe('stitch_failed');
+      expect(failedSession.body.session.scenes[0].status).toBe('completed');
+      expect(failedSession.body.session.scenes[1].status).toBe('completed');
+      expect(ledger.getBalance('usr_demo_101')).toEqual({
+        credits: 8,
+        reservedCredits: 0,
+        availableCredits: 8
+      });
+
+      // Restore missing clip and trigger free re-stitch
+      fs.copyFileSync(fixtureVid, scene1VideoPath);
+      const recoveryRes = await request(appInstance.app)
+        .post('/api/dreams/stitch')
+        .send({ dreamId })
+        .expect(202);
+
+      const recoveryDone = await waitForJobCompletion(appInstance.app, recoveryRes.body.jobId, 20000);
+      expect(recoveryDone.job.status).toBe('completed');
+
+      const recoveredSession = await request(appInstance.app).get(`/api/dreams/session/${dreamId}`).expect(200);
+      expect(recoveredSession.body.session.status).toBe('completed');
+      expect(recoveredSession.body.session.video?.isStitched).toBe(true);
+      expect(ledger.getBalance('usr_demo_101')).toEqual({
+        credits: 8,
+        reservedCredits: 0,
+        availableCredits: 8
+      });
+    }, 30000);
   });
 
   describe('Bug 3: Non-existent scene silent fallback to Scene 1', () => {
@@ -399,7 +511,7 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       const kfId = session!.scenes[0].keyframes![0].id;
 
       // Start video job
-      await request(appInstance.app)
+      const videoRes = await request(appInstance.app)
         .post('/api/dreams/generate-video')
         .send({ dreamId, sceneId, keyframeId: kfId })
         .expect(202);
@@ -418,6 +530,10 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
         .send({ newSceneText: "Yeni sahne" })
         .expect(409);
       expect(splitConflict.body.error).toBe('DREAM_BUSY');
+
+      // Wait for background video job to finish before afterEach cleans up tempStorageDir
+      const videoDone = await waitForJobCompletion(appInstance.app, videoRes.body.jobId, 15000);
+      expect(videoDone.job.status).toBe('completed');
     });
   });
 
@@ -427,14 +543,13 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
 
     beforeEach(() => {
       const SERVER_ROOT = path.resolve(__dirname, '..');
-      const STORAGE_DIR = path.join(SERVER_ROOT, 'storage');
       const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
       // Mock architect with 80ms delay to reliably test concurrency race conditions
       const delayedArchitect = new MockDreamArchitect(80);
       const provider = new MockDreamProvider(
         'http://127.0.0.1:5000',
-        path.join(STORAGE_DIR, 'videos'),
-        path.join(STORAGE_DIR, 'keyframes'),
+        path.join(tempStorageDir, 'videos'),
+        path.join(tempStorageDir, 'keyframes'),
         FIXTURES_DIR,
         delayedArchitect
       );
@@ -449,6 +564,10 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
         queueDriver: 'memory',
         transitionSeconds: 0.3
       });
+    });
+
+    afterEach(async () => {
+      await delayedAppInstance.dreamQueue.close();
     });
 
     it('should reject concurrent split requests with 409 DREAM_BUSY to prevent race conditions', async () => {
@@ -483,7 +602,41 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
     });
 
     it('should reject video generation with 409 DREAM_BUSY while Architect is editing/synthesizing', async () => {
-      const analyzeRes = await request(delayedAppInstance.app)
+      const SERVER_ROOT = path.resolve(__dirname, '..');
+      const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
+
+      let markSplitEntered!: () => void;
+      const splitEntered = new Promise<void>(resolve => {
+        markSplitEntered = resolve;
+      });
+      let releaseSplit!: () => void;
+      const splitCanFinish = new Promise<void>(resolve => {
+        releaseSplit = resolve;
+      });
+
+      const barrierArchitect = new MockDreamArchitect(0);
+      const originalSynthesize = barrierArchitect.synthesizeSingleScene.bind(barrierArchitect);
+      barrierArchitect.synthesizeSingleScene = async (narrative, moodHint) => {
+        markSplitEntered();
+        await splitCanFinish;
+        return originalSynthesize(narrative, moodHint);
+      };
+
+      const barrierApp = createApp({
+        dreamProvider: new MockDreamProvider(
+          'http://127.0.0.1:5000',
+          path.join(tempStorageDir, 'videos'),
+          path.join(tempStorageDir, 'keyframes'),
+          FIXTURES_DIR,
+          barrierArchitect
+        ),
+        dreamArchitect: barrierArchitect,
+        creditLedger: new CreditLedger({ usr_demo_101: { credits: 10, reservedCredits: 0 } }),
+        queueDriver: 'memory',
+        transitionSeconds: 0.3
+      });
+
+      const analyzeRes = await request(barrierApp.app)
         .post('/api/dreams/analyze')
         .send({ rawDreamText: 'Sakin bir sahil' })
         .expect(200);
@@ -492,29 +645,33 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       const sceneId = analyzeRes.body.data.scenes[0].sceneId;
 
       // Generate keyframe first so scene has a valid keyframe
-      const kfRes = await request(delayedAppInstance.app)
+      const kfRes = await request(barrierApp.app)
         .post('/api/dreams/keyframes')
         .send({ dreamId, sceneId, count: 1 })
         .expect(202);
-      await delayedAppInstance.dreamQueue.waitForJobResult(kfRes.body.jobId);
+      await waitForJobCompletion(barrierApp.app, kfRes.body.jobId, 15000);
 
-      const session = delayedAppInstance.dreamSessions.get(dreamId);
+      const session = barrierApp.dreamSessions.get(dreamId);
       const kfId = session!.scenes[0].keyframes![0].id;
 
-      // Launch split (takes 80ms) and attempt video generation concurrently (after 15ms)
-      const [splitRes, videoRes] = await Promise.all([
-        request(delayedAppInstance.app)
-          .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
-          .send({ newSceneText: 'Güneş batımı' }),
-        new Promise<request.Response>((resolve, reject) => {
-          setTimeout(() => {
-            request(delayedAppInstance.app)
-              .post('/api/dreams/generate-video')
-              .send({ dreamId, sceneId, keyframeId: kfId })
-              .end((err, res) => (err ? reject(err) : resolve(res)));
-          }, 15);
-        })
-      ]);
+      // Start split immediately (.then triggers Supertest request execution) and wait until Architect holds the lock
+      const splitPromise = request(barrierApp.app)
+        .post(`/api/dreams/session/${dreamId}/scenes/${sceneId}/split`)
+        .send({ newSceneText: 'Güneş batımı' })
+        .then(res => res);
+
+      let videoRes!: request.Response;
+      let splitRes!: request.Response;
+      try {
+        await splitEntered;
+        videoRes = await request(barrierApp.app)
+          .post('/api/dreams/generate-video')
+          .send({ dreamId, sceneId, keyframeId: kfId });
+      } finally {
+        releaseSplit();
+        splitRes = await splitPromise;
+        await barrierApp.dreamQueue.close();
+      }
 
       expect(splitRes.status).toBe(200);
       expect(videoRes.status).toBe(409);
@@ -540,8 +697,8 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       const customApp = createApp({
         dreamProvider: new MockDreamProvider(
           'http://127.0.0.1:5000',
-          path.join(SERVER_ROOT, 'storage', 'videos'),
-          path.join(SERVER_ROOT, 'storage', 'keyframes'),
+          path.join(tempStorageDir, 'videos'),
+          path.join(tempStorageDir, 'keyframes'),
           path.join(SERVER_ROOT, 'fixtures'),
           customArchitect
         ),
@@ -603,8 +760,8 @@ describe('API Bug Fixes & Edge Case Integration Tests (Supertest)', () => {
       const customApp = createApp({
         dreamProvider: new MockDreamProvider(
           'http://127.0.0.1:5000',
-          path.join(SERVER_ROOT, 'storage', 'videos'),
-          path.join(SERVER_ROOT, 'storage', 'keyframes'),
+          path.join(tempStorageDir, 'videos'),
+          path.join(tempStorageDir, 'keyframes'),
           path.join(SERVER_ROOT, 'fixtures'),
           multiSceneArchitect
         ),

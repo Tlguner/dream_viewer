@@ -1,6 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
 import { createApp, formatMixedModeWarning } from '../src/app.js';
 import { MockDreamProvider } from '../src/providers/mock_provider.js';
 import { MockDreamArchitect, OpenAICompatibleArchitect } from '../src/architect/index.js';
@@ -8,15 +10,30 @@ import { CreditLedger } from '../src/billing/credit_ledger.js';
 
 describe('/api/health Architect Telemetry & Mixed-Mode Warning', () => {
   const SERVER_ROOT = path.resolve(__dirname, '..');
-  const STORAGE_DIR = path.join(SERVER_ROOT, 'storage');
   const FIXTURES_DIR = path.join(SERVER_ROOT, 'fixtures');
+  const originalStorageDir = process.env.STORAGE_DIR;
+  let tempStorageDir: string;
+
+  beforeEach(() => {
+    tempStorageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-health-test-'));
+    process.env.STORAGE_DIR = tempStorageDir;
+  });
+
+  afterEach(() => {
+    if (originalStorageDir === undefined) {
+      delete process.env.STORAGE_DIR;
+    } else {
+      process.env.STORAGE_DIR = originalStorageDir;
+    }
+    fs.rmSync(tempStorageDir, { recursive: true, force: true });
+  });
 
   it('should include mock architect provider, isMock=true, and model=null in /api/health', async () => {
     const architect = new MockDreamArchitect();
     const provider = new MockDreamProvider(
       'http://127.0.0.1:5000',
-      path.join(STORAGE_DIR, 'videos'),
-      path.join(STORAGE_DIR, 'keyframes'),
+      path.join(tempStorageDir, 'videos'),
+      path.join(tempStorageDir, 'keyframes'),
       FIXTURES_DIR,
       architect
     );
@@ -45,8 +62,8 @@ describe('/api/health Architect Telemetry & Mixed-Mode Warning', () => {
     );
     const provider = new MockDreamProvider(
       'http://127.0.0.1:5000',
-      path.join(STORAGE_DIR, 'videos'),
-      path.join(STORAGE_DIR, 'keyframes'),
+      path.join(tempStorageDir, 'videos'),
+      path.join(tempStorageDir, 'keyframes'),
       FIXTURES_DIR,
       architect
     );
@@ -77,3 +94,4 @@ describe('/api/health Architect Telemetry & Mixed-Mode Warning', () => {
     expect(formatMixedModeWarning({ isMock: true }, { isMock: false })).toBeNull();
   });
 });
+

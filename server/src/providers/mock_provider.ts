@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { 
   IDreamProvider, 
@@ -252,7 +253,7 @@ export class MockDreamProvider implements IDreamProvider {
 
     this.ensureFixturesInStorage();
 
-    const videoId = `mock_vid_${Date.now()}`;
+    const videoId = `mock_vid_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
     const filename = `${videoId}.mp4`;
     const localPath = path.join(this.storageVideosDir, filename);
 
