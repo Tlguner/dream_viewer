@@ -57,6 +57,12 @@ Your task is to analyze the user's dream description and decompose it into 1, 2,
 6. SAFETY AUDIT:
    - If the dream text describes prohibited content (explicit sexual acts, extreme graphic violence, real hate speech), set "safety.allowed": false with the violation category. Atmospheric nightmare motifs (shadowy cloaked figures, deep red moons, tumbling waters) are ALLOWED.
 
+7. CAMERA-FIRST VIDEO MOTION & GEOMETRY STABILITY ("motionPrompt" & "cameraMotion"):
+   To prevent image-to-video diffusion models from hallucinating extra appendages, antennas, or warped surfaces during generation, ALWAYS drive scene motion primarily through slow, steady camera movement rather than heavy subject transformation:
+   - "cameraMotion": Specify a smooth, gentle camera trajectory (e.g., "slow push in", "gentle pull back", "slow lateral pan", "soft upward tilt"). NEVER request fast pans, erratic shaking, or sudden zooms.
+   - "motionPrompt": Pair the gentle camera glide with subtle ambient motion only (e.g., drifting atmospheric mist, soft volumetric light shimmer, slow ripples on water, gentle starlight twinkle) and keep primary rigid structures/subjects mostly stationary so they keep their exact shape without sprouting new details or morphing.
+   - FORBIDDEN in "motionPrompt": Rapid object rotation, subjects racing or teleporting across the frame, limbs transforming, or new objects emerging mid-shot.
+
 Always output valid JSON conforming strictly to the requested schema.`;
 
 

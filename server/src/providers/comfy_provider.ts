@@ -92,10 +92,10 @@ export class ComfyDreamProvider implements IDreamProvider {
     const keyframeBackend = parseKeyframeBackend(process.env.KEYFRAME_BACKEND);
 
     return {
-      videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '121', 10),
+      videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '49', 10),
       videoTimeoutMs: parseInt(process.env.WAN_VIDEO_TIMEOUT_MS || '900000', 10),
-      easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
-      steps: parseInt(process.env.WAN_STEPS || '15', 10),
+      easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0'),
+      steps: parseInt(process.env.WAN_STEPS || '20', 10),
       keyframeSteps: parseInt(process.env.KEYFRAME_STEPS || '25', 10),
       wanKeyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '20', 10),
       width: parseInt(process.env.WAN_WIDTH || '832', 10),
@@ -560,128 +560,27 @@ export class ComfyDreamProvider implements IDreamProvider {
     const comfyImageName = await this.uploadImageToComfy(imageBytes, uploadedFilename);
     console.log(`🖼️ [ComfyDreamProvider] Keyframe uploaded to ComfyUI as: ${comfyImageName}`);
 
-    // 3. Build Wan 2.2 5B + EasyCache Image-to-Video Graph with configured parameters
+    // 3. Build Wan 2.2 5B Image-to-Video Graph with configured parameters
     const seed = Math.floor(Math.random() * 9007199254740991);
     const { videoFrames, easyCacheThreshold, steps, width, height, fps, shift, cfg } = this.config;
-    console.log(`🎬 [ComfyDreamProvider] Configured Video: ${videoFrames} frames (~${(videoFrames / fps).toFixed(1)}s raw, ~${((videoFrames / fps) * 2).toFixed(1)}s on-twos) @ ${fps}fps (${width}x${height}, ${steps} steps)`);
+    const easyCacheLabel = Number.isFinite(easyCacheThreshold) && easyCacheThreshold > 0 ? easyCacheThreshold : 'OFF';
+    console.log(`🎬 [ComfyDreamProvider] Configured Video: ${videoFrames} frames (~${(videoFrames / fps).toFixed(1)}s raw, ~${((videoFrames / fps) * 2).toFixed(1)}s on-twos) @ ${fps}fps (${width}x${height}, ${steps} steps, easyCache=${easyCacheLabel})`);
 
-    const workflowPrompt: Record<string, any> = {
-      "37": {
-        "class_type": "UNETLoader",
-        "inputs": {
-          "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-          "weight_dtype": "default"
-        }
-      },
-      "60": {
-        "class_type": "EasyCache",
-        "inputs": {
-          "reuse_threshold": easyCacheThreshold,
-          "start_percent": 0.15,
-          "end_percent": 0.95,
-          "verbose": false,
-          "model": ["37", 0]
-        }
-      },
-      "48": {
-        "class_type": "ModelSamplingSD3",
-        "inputs": {
-          "shift": shift,
-          "model": ["60", 0]
-        }
-      },
-      "38": {
-        "class_type": "CLIPLoader",
-        "inputs": {
-          "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-          "type": "wan",
-          "device": "default"
-        }
-      },
-      "39": {
-        "class_type": "VAELoader",
-        "inputs": {
-          "vae_name": "wan2.2_vae.safetensors"
-        }
-      },
-      "6": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-          "text": this.sanitizeForPrompt(`${motionPrompt}. ${cameraMotion}. Smooth motion, high temporal coherence, 24fps.`),
-          "clip": ["38", 0]
-        }
-      },
-      "7": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-          "text": `${SafetyShield.getNegativePrompt()}, jitter, morphing, sudden camera cuts, flashing distortion, warped geometry, rapid flicker, frozen frame, watermark, blurry`,
-          "clip": ["38", 0]
-        }
-      },
-      "56": {
-        "class_type": "LoadImage",
-        "inputs": {
-          "image": comfyImageName
-        }
-      },
-      "55": {
-        "class_type": "Wan22ImageToVideoLatent",
-        "inputs": {
-          "width": width,
-          "height": height,
-          "length": videoFrames,
-          "batch_size": 1,
-          "vae": ["39", 0],
-          "start_image": ["56", 0]
-        }
-      },
-      "3": {
-        "class_type": "KSampler",
-        "inputs": {
-          "seed": seed,
-          "steps": steps,
-          "cfg": cfg,
-          "sampler_name": "uni_pc",
-          "scheduler": "simple",
-          "denoise": 1,
-          "model": ["48", 0],
-          "positive": ["6", 0],
-          "negative": ["7", 0],
-          "latent_image": ["55", 0]
-        }
-      },
-      "8": {
-        "class_type": "VAEDecodeTiled",
-        "inputs": {
-          "samples": ["3", 0],
-          "vae": ["39", 0],
-          "tile_size": 512,
-          "overlap": 64,
-          "temporal_size": 64,
-          "temporal_overlap": 8
-        }
-      },
-      "57": {
-        "class_type": "CreateVideo",
-        "inputs": {
-          "fps": fps,
-          "bit_depth": "auto",
-          "color_space": "sRGB",
-          "codec": "none",
-          "images": ["8", 0]
-        }
-      },
-      "58": {
-        "class_type": "SaveVideo",
-        "inputs": {
-          "filename_prefix": "video/DreamViewer",
-          "format": "auto",
-          "format.codec": "auto",
-          "codec": "auto",
-          "video": ["57", 0]
-        }
-      }
-    };
+    const positivePrompt = this.sanitizeForPrompt(`${motionPrompt}. ${cameraMotion}. Smooth motion, high temporal coherence, 24fps.`);
+    const workflowPrompt = buildWanVideoGraph({
+      comfyImageName,
+      positivePrompt,
+      negativePrompt: buildVideoNegativePrompt(),
+      seed,
+      videoFrames,
+      easyCacheThreshold,
+      steps,
+      width,
+      height,
+      fps,
+      shift,
+      cfg
+    });
 
     this.ensureWebSocket();
 
@@ -907,4 +806,178 @@ export class ComfyDreamProvider implements IDreamProvider {
       isMock: false
     };
   }
+}
+
+export interface WanVideoGraphParams {
+  comfyImageName: string;
+  positivePrompt: string;
+  negativePrompt?: string;
+  seed: number;
+  videoFrames: number;
+  easyCacheThreshold: number;
+  steps: number;
+  width: number;
+  height: number;
+  fps: number;
+  shift: number;
+  cfg: number;
+}
+
+/**
+ * Builds the video negative prompt combining safety negatives with anti-morphing
+ * and anti-freeze directives for Wan 2.2 Image-to-Video generation.
+ */
+export function buildVideoNegativePrompt(): string {
+  return [
+    SafetyShield.getNegativePrompt(),
+    'jitter',
+    'morphing',
+    'sudden camera cuts',
+    'flashing distortion',
+    'warped geometry',
+    'rapid flicker',
+    'frozen frame',
+    'extra parts',
+    'extra antennas',
+    'new objects appearing',
+    'changing shape',
+    'growing parts',
+    'static',
+    'still image',
+    'no motion',
+    'watermark',
+    'blurry'
+  ].join(', ');
+}
+
+/**
+ * Builds the Wan 2.2 5B Image-to-Video ComfyUI API graph.
+ * When `easyCacheThreshold <= 0` (or non-finite), EasyCache node "60" is omitted
+ * and ModelSamplingSD3 ("48") connects directly to UNETLoader ("37").
+ */
+export function buildWanVideoGraph(params: WanVideoGraphParams): Record<string, any> {
+  const useEasyCache = Number.isFinite(params.easyCacheThreshold) && params.easyCacheThreshold > 0;
+  const negativeText = params.negativePrompt ?? buildVideoNegativePrompt();
+
+  return {
+    "37": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    ...(useEasyCache
+      ? {
+          "60": {
+            "class_type": "EasyCache",
+            "inputs": {
+              "reuse_threshold": params.easyCacheThreshold,
+              "start_percent": 0.15,
+              "end_percent": 0.95,
+              "verbose": false,
+              "model": ["37", 0]
+            }
+          }
+        }
+      : {}),
+    "48": {
+      "class_type": "ModelSamplingSD3",
+      "inputs": {
+        "shift": params.shift,
+        "model": [useEasyCache ? "60" : "37", 0]
+      }
+    },
+    "38": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "type": "wan",
+        "device": "default"
+      }
+    },
+    "39": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "wan2.2_vae.safetensors"
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": params.positivePrompt,
+        "clip": ["38", 0]
+      }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": negativeText,
+        "clip": ["38", 0]
+      }
+    },
+    "56": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": params.comfyImageName
+      }
+    },
+    "55": {
+      "class_type": "Wan22ImageToVideoLatent",
+      "inputs": {
+        "width": params.width,
+        "height": params.height,
+        "length": params.videoFrames,
+        "batch_size": 1,
+        "vae": ["39", 0],
+        "start_image": ["56", 0]
+      }
+    },
+    "3": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": params.seed,
+        "steps": params.steps,
+        "cfg": params.cfg,
+        "sampler_name": "uni_pc",
+        "scheduler": "simple",
+        "denoise": 1,
+        "model": ["48", 0],
+        "positive": ["6", 0],
+        "negative": ["7", 0],
+        "latent_image": ["55", 0]
+      }
+    },
+    "8": {
+      "class_type": "VAEDecodeTiled",
+      "inputs": {
+        "samples": ["3", 0],
+        "vae": ["39", 0],
+        "tile_size": 512,
+        "overlap": 64,
+        "temporal_size": 64,
+        "temporal_overlap": 8
+      }
+    },
+    "57": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "fps": params.fps,
+        "bit_depth": "auto",
+        "color_space": "sRGB",
+        "codec": "none",
+        "images": ["8", 0]
+      }
+    },
+    "58": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "filename_prefix": "video/DreamViewer",
+        "format": "auto",
+        "format.codec": "auto",
+        "codec": "auto",
+        "video": ["57", 0]
+      }
+    }
+  };
 }

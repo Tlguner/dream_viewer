@@ -117,8 +117,9 @@ export async function stitchSceneVideos(
     '-filter_complex', filterComplex,
     '-map', '[vout]',
     '-c:v', 'libx264',
+    '-crf', '16',
+    '-preset', 'slow',
     '-pix_fmt', 'yuv420p',
-    '-preset', 'fast',
     outputPath
   );
 
