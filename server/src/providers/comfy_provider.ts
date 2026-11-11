@@ -13,6 +13,13 @@ import {
 } from '../types/index.js';
 import { SafetyShield } from '../moderation/shield.js';
 import { IDreamArchitect, OpenAICompatibleArchitect } from '../architect/index.js';
+import {
+  parseKeyframeBackend,
+  buildSdxlKeyframeGraph,
+  buildWanKeyframeGraph,
+  collectSavedKeyframeImages,
+  ComfySavedImageRef
+} from './comfy/keyframe_graphs.js';
 
 export class ComfyDreamProvider implements IDreamProvider {
   public name = 'ComfyUI (Wan 2.2 5B + EasyCache GPU)';
@@ -62,9 +69,9 @@ export class ComfyDreamProvider implements IDreamProvider {
     }
   }
 
-  // Dynamically load Wan 2.2 parameters so .env edits apply immediately in development without server restart
+  // Dynamically load parameters so .env edits apply immediately in development without server restart
   private get config() {
-    if (process.env.NODE_ENV !== 'production') {
+    if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
       try {
         const candidatePaths = [
           path.resolve(this.storageVideosDir, '..', '..', '..', '.env'), // project root (dream_viewer/.env)
@@ -82,19 +89,32 @@ export class ComfyDreamProvider implements IDreamProvider {
       }
     }
 
+    const keyframeBackend = parseKeyframeBackend(process.env.KEYFRAME_BACKEND);
+
     return {
       videoFrames: parseInt(process.env.WAN_VIDEO_FRAMES || '121', 10),
       videoTimeoutMs: parseInt(process.env.WAN_VIDEO_TIMEOUT_MS || '900000', 10),
       easyCacheThreshold: parseFloat(process.env.WAN_EASYCACHE_THRESHOLD || '0.15'),
       steps: parseInt(process.env.WAN_STEPS || '15', 10),
-      keyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '20', 10),
+      keyframeSteps: parseInt(process.env.KEYFRAME_STEPS || '25', 10),
+      wanKeyframeSteps: parseInt(process.env.WAN_KEYFRAME_STEPS || '20', 10),
       width: parseInt(process.env.WAN_WIDTH || '832', 10),
       height: parseInt(process.env.WAN_HEIGHT || '480', 10),
       fps: parseInt(process.env.WAN_FPS || '24', 10),
       shift: parseFloat(process.env.WAN_SHIFT || '8.0'),
       cfg: parseFloat(process.env.WAN_CFG || '5.0'),
+      keyframeBackend,
+      keyframeCheckpoint: (process.env.KEYFRAME_CHECKPOINT || 'Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors').trim(),
+      keyframeWidth: parseInt(process.env.KEYFRAME_WIDTH || '1344', 10),
+      keyframeHeight: parseInt(process.env.KEYFRAME_HEIGHT || '768', 10),
+      keyframeCfg: parseFloat(process.env.KEYFRAME_CFG || '6.5'),
+      keyframeSampler: (process.env.KEYFRAME_SAMPLER || 'dpmpp_2m').trim(),
+      keyframeScheduler: (process.env.KEYFRAME_SCHEDULER || 'karras').trim(),
+      keyframeTimeoutMs: parseInt(process.env.KEYFRAME_TIMEOUT_MS || '180000', 10),
     };
   }
+
+  public pollIntervalMs: number = 1500;
 
   constructor(
     comfyHost = process.env.COMFYUI_HOST || 'http://127.0.0.1:8188',
@@ -111,6 +131,53 @@ export class ComfyDreamProvider implements IDreamProvider {
 
     fs.mkdirSync(this.storageVideosDir, { recursive: true });
     fs.mkdirSync(this.storageKeyframesDir, { recursive: true });
+  }
+
+  /**
+   * Verifies at startup that the configured SDXL keyframe checkpoint exists in ComfyUI.
+   */
+  public async verifyKeyframeModel(): Promise<void> {
+    const cfg = this.config;
+
+    if (cfg.keyframeBackend !== 'sdxl') {
+      console.log(`ℹ️ [ComfyDreamProvider] KEYFRAME_BACKEND="${cfg.keyframeBackend}". Skipping SDXL CheckpointLoaderSimple check.`);
+      return;
+    }
+
+    const url = `${this.comfyHost}/object_info/CheckpointLoaderSimple`;
+    let res: Response;
+    try {
+      res = await fetch(url);
+    } catch (err: any) {
+      throw new Error(
+        `ComfyUI is unreachable at ${this.comfyHost} while verifying SDXL keyframe checkpoint "${cfg.keyframeCheckpoint}": ${err.message}`
+      );
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(
+        `Failed to query ComfyUI checkpoints at ${url} (${res.status}): ${errText}`
+      );
+    }
+
+    const data = (await res.json()) as any;
+    const availableCheckpoints = data?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0];
+
+    if (!Array.isArray(availableCheckpoints)) {
+      throw new Error(
+        `Unexpected response from ComfyUI /object_info/CheckpointLoaderSimple; could not locate checkpoint list.`
+      );
+    }
+
+    if (!availableCheckpoints.includes(cfg.keyframeCheckpoint)) {
+      const availableList = availableCheckpoints.length > 0 ? availableCheckpoints.join(', ') : '(none)';
+      throw new Error(
+        `Configured KEYFRAME_CHECKPOINT "${cfg.keyframeCheckpoint}" was not found in ComfyUI checkpoints. Available models: [${availableList}]`
+      );
+    }
+
+    console.log(`✅ [ComfyDreamProvider] Verified SDXL keyframe checkpoint: ${cfg.keyframeCheckpoint}`);
   }
 
   private sanitizeForPrompt(text: string): string {
@@ -228,117 +295,39 @@ export class ComfyDreamProvider implements IDreamProvider {
   }
 
   /**
-   * Generate 100% genuine GPU keyframes using Wan 2.2 length:1 text-to-image.
-   * In Comfy mode, this does NOT fall back to Unsplash stock photos.
-   * Generates `count` distinct seeds in a single cached ComfyUI execution graph.
+   * Generate 100% genuine GPU keyframes using SDXL (default) or Wan 2.2 text-to-image.
+   * In Comfy mode, this does NOT fall back to stock photos.
    */
   public async generateKeyframes(
     keyframePrompt: string, 
     count: number = 3,
     onProgress?: ProgressCallback
   ): Promise<KeyframeOption[]> {
-    console.log(`🎨 [ComfyDreamProvider] Generating ${count} genuine GPU keyframes via Wan 2.2...`);
-
+    const cfg = this.config;
+    const sanitizedPrompt = this.sanitizeForPrompt(keyframePrompt);
+    const keyframeNegativePrompt = `${SafetyShield.getNegativePrompt()}, people, person, face, text, watermark, logo, cartoon, blurry, low quality, distorted, deformed, multiple objects`;
     const baseSeed = Math.floor(Math.random() * 8000000000000000);
-    const kfPrompt: Record<string, any> = {
-      "37": {
-        "class_type": "UNETLoader",
-        "inputs": {
-          "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-          "weight_dtype": "default"
-        }
-      },
-      "48": {
-        "class_type": "ModelSamplingSD3",
-        "inputs": {
-          "shift": this.config.shift,
-          "model": ["37", 0]
-        }
-      },
-      "38": {
-        "class_type": "CLIPLoader",
-        "inputs": {
-          "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-          "type": "wan",
-          "device": "default"
-        }
-      },
-      "39": {
-        "class_type": "VAELoader",
-        "inputs": {
-          "vae_name": "wan2.2_vae.safetensors"
-        }
-      },
-      "6": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-          "text": this.sanitizeForPrompt(keyframePrompt),
-          "clip": ["38", 0]
-        }
-      },
-      "7": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-          "text": `${SafetyShield.getNegativePrompt()}, blurry, low resolution, flat lighting, muddy textures, deformed, oversaturated, obscuring thick fog, dark smear, watermark, cartoon, 3d render`,
-          "clip": ["38", 0]
-        }
-      },
-      "55": {
-        "class_type": "Wan22ImageToVideoLatent",
-        "inputs": {
-          "width": this.config.width,
-          "height": this.config.height,
-          "length": 1, // 1 frame produces a single still keyframe
-          "batch_size": 1,
-          "vae": ["39", 0]
-        }
-      }
-    };
 
-    // Construct distinct KSamplers and SaveImage nodes for each keyframe in the same prompt
-    const saveNodeIds: string[] = [];
-    const seeds: number[] = [];
+    console.log(`🎨 [ComfyDreamProvider] Generating ${count} genuine GPU keyframes via ${cfg.keyframeBackend.toUpperCase()}...`);
 
-    for (let i = 0; i < count; i++) {
-      const seed = baseSeed + (i * 1013904223);
-      seeds.push(seed);
-      const ksamplerId = `ksampler_kf_${i + 1}`;
-      const vaeDecodeId = `vaedecode_kf_${i + 1}`;
-      const saveImageId = `saveimage_kf_${i + 1}`;
-      saveNodeIds.push(saveImageId);
-
-      kfPrompt[ksamplerId] = {
-        "class_type": "KSampler",
-        "inputs": {
-          "seed": seed,
-          "steps": this.config.keyframeSteps,
-          "cfg": this.config.cfg,
-          "sampler_name": "uni_pc",
-          "scheduler": "simple",
-          "denoise": 1,
-          "model": ["48", 0],
-          "positive": ["6", 0],
-          "negative": ["7", 0],
-          "latent_image": ["55", 0]
-        }
-      };
-
-      kfPrompt[vaeDecodeId] = {
-        "class_type": "VAEDecode",
-        "inputs": {
-          "samples": [ksamplerId, 0],
-          "vae": ["39", 0]
-        }
-      };
-
-      kfPrompt[saveImageId] = {
-        "class_type": "SaveImage",
-        "inputs": {
-          "filename_prefix": `keyframe/DreamViewer_KF_${i + 1}`,
-          "images": [vaeDecodeId, 0]
-        }
-      };
-    }
+    const { graph: kfPrompt, saveNodeIds } =
+      cfg.keyframeBackend === 'sdxl'
+        ? buildSdxlKeyframeGraph(sanitizedPrompt, keyframeNegativePrompt, count, baseSeed, {
+            checkpoint: cfg.keyframeCheckpoint,
+            width: cfg.keyframeWidth,
+            height: cfg.keyframeHeight,
+            steps: cfg.keyframeSteps,
+            cfg: cfg.keyframeCfg,
+            sampler: cfg.keyframeSampler,
+            scheduler: cfg.keyframeScheduler
+          })
+        : buildWanKeyframeGraph(sanitizedPrompt, keyframeNegativePrompt, count, baseSeed, {
+            width: cfg.width,
+            height: cfg.height,
+            steps: cfg.wanKeyframeSteps,
+            cfg: cfg.cfg,
+            shift: cfg.shift
+          });
 
     this.ensureWebSocket();
 
@@ -357,10 +346,11 @@ export class ComfyDreamProvider implements IDreamProvider {
     const promptId = queueData.prompt_id;
     console.log(`🚀 [ComfyDreamProvider] Keyframe prompt enqueued with ID: ${promptId}`);
 
-    // Poll for keyframe completion (up to 90 seconds for 3 keyframes)
+    // Poll for keyframe completion using configured KEYFRAME_TIMEOUT_MS
     const startTime = Date.now();
-    const timeoutMs = 90_000;
+    const timeoutMs = cfg.keyframeTimeoutMs;
     let completedItem: any = null;
+    let completedImages: ComfySavedImageRef[] = [];
 
     const kfProgressListener = (msg: any) => {
       try {
@@ -374,40 +364,57 @@ export class ComfyDreamProvider implements IDreamProvider {
           onProgress?.({
             stage: 'INITIALIZING',
             stageLabel: 'Composition Engine',
-            detail: `Synthesizing ${count} artistic anchors on RTX GPU...`,
+            detail: `Synthesizing ${count} artistic anchors on RTX GPU (${cfg.keyframeBackend.toUpperCase()})...`,
             percent: 5,
             elapsedSeconds: Math.round(elapsedSec),
-            etaSeconds: 18
+            etaSeconds: 20
           });
         } else if (msg.type === 'progress') {
           const val = Number(data.value || 0);
           const max = Number(data.max || 10);
           const ratio = Math.min(1, Math.max(0, val / max));
 
-          let basePercent = 8;
-          let currentKfIndex = 1;
-          if (data.node === 'ksampler_kf_2') {
-            basePercent = 38;
-            currentKfIndex = 2;
-          } else if (data.node === 'ksampler_kf_3') {
-            basePercent = 68;
-            currentKfIndex = 3;
+          if (cfg.keyframeBackend === 'sdxl' || data.node === 'kf_sampler') {
+            const percent = Math.min(95, Math.max(5, Math.round((val / max) * 100)));
+            const remainingSec = Math.max(2, Math.round((1 - ratio) * 25));
+
+            onProgress?.({
+              stage: 'DIFFUSION',
+              stageLabel: 'Synthesizing Keyframes (SDXL)',
+              detail: `Rendering ${count} keyframe variations (Step ${val}/${max})`,
+              percent,
+              step: val,
+              totalSteps: max,
+              elapsedSeconds: Math.round(elapsedSec),
+              etaSeconds: remainingSec,
+              nodeType: 'KSampler'
+            });
+          } else {
+            let basePercent = 8;
+            let currentKfIndex = 1;
+            if (data.node === 'ksampler_kf_2') {
+              basePercent = 38;
+              currentKfIndex = 2;
+            } else if (data.node === 'ksampler_kf_3') {
+              basePercent = 68;
+              currentKfIndex = 3;
+            }
+
+            const percent = Math.min(95, Math.round(basePercent + (ratio * 28)));
+            const remainingSec = Math.max(2, Math.round((count - currentKfIndex + 1 - ratio) * 6));
+
+            onProgress?.({
+              stage: 'DIFFUSION',
+              stageLabel: 'Synthesizing Keyframes',
+              detail: `Rendering Keyframe ${currentKfIndex}/${count} (Step ${val}/${max})`,
+              percent,
+              step: val,
+              totalSteps: max,
+              elapsedSeconds: Math.round(elapsedSec),
+              etaSeconds: remainingSec,
+              nodeType: 'KSampler'
+            });
           }
-
-          const percent = Math.min(95, Math.round(basePercent + (ratio * 28)));
-          const remainingSec = Math.max(2, Math.round((count - currentKfIndex + 1 - ratio) * 6));
-
-          onProgress?.({
-            stage: 'DIFFUSION',
-            stageLabel: 'Synthesizing Keyframes',
-            detail: `Rendering Keyframe ${currentKfIndex}/${count} (Step ${val}/${max})`,
-            percent,
-            step: val,
-            totalSteps: max,
-            elapsedSeconds: Math.round(elapsedSec),
-            etaSeconds: remainingSec,
-            nodeType: 'KSampler'
-          });
         }
       } catch (err: any) {
         console.warn('Keyframe progress listener error:', err.message);
@@ -418,7 +425,7 @@ export class ComfyDreamProvider implements IDreamProvider {
 
     try {
       while (Date.now() - startTime < timeoutMs) {
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, this.pollIntervalMs));
         const hRes = await fetch(`${this.comfyHost}/history/${promptId}`);
         if (!hRes.ok) continue;
 
@@ -437,8 +444,10 @@ export class ComfyDreamProvider implements IDreamProvider {
             throw new Error(`ComfyUI keyframe generation failed: ${errMsg}`);
           }
 
-          if (item.outputs && Object.keys(item.outputs).length >= count) {
+          const savedImages = collectSavedKeyframeImages(item.outputs, saveNodeIds);
+          if (savedImages.length >= count) {
             completedItem = item;
+            completedImages = savedImages.slice(0, count);
             break;
           }
         }
@@ -459,16 +468,9 @@ export class ComfyDreamProvider implements IDreamProvider {
 
     // Process and persist all generated keyframe images into server storage
     const keyframes: KeyframeOption[] = [];
-    const outputs = completedItem.outputs;
 
-    for (let i = 0; i < saveNodeIds.length; i++) {
-      const nodeId = saveNodeIds[i];
-      const nodeOut = outputs[nodeId];
-      if (!nodeOut || !nodeOut.images || nodeOut.images.length === 0) {
-        throw new Error(`Expected image output missing for keyframe node ${nodeId}`);
-      }
-
-      const outImg = nodeOut.images[0];
+    for (let i = 0; i < completedImages.length; i++) {
+      const outImg = completedImages[i];
       const comfyViewUrl = `${this.comfyHost}/view?filename=${encodeURIComponent(outImg.filename)}&subfolder=${encodeURIComponent(outImg.subfolder || '')}&type=output`;
 
       const imgRes = await fetch(comfyViewUrl);
@@ -485,13 +487,13 @@ export class ComfyDreamProvider implements IDreamProvider {
         id: keyframeId,
         imageUrl: `${this.serverBaseUrl}/api/media/keyframes/${localFilename}`,
         aspectRatio: '16:9',
-        seed: seeds[i],
+        seed: cfg.keyframeBackend === 'sdxl' ? baseSeed + i : baseSeed + (i * 1013904223),
         isMock: false, // 100% genuine GPU generated keyframe!
         isSelected: i === 0
       });
     }
 
-    console.log(`✅ [ComfyDreamProvider] Successfully generated and stored ${keyframes.length} GPU keyframes.`);
+    console.log(`✅ [ComfyDreamProvider] Successfully generated and stored ${keyframes.length} GPU keyframes (${cfg.keyframeBackend.toUpperCase()}).`);
     return keyframes;
   }
 
